@@ -7,6 +7,14 @@ const src = @import("src.zig");
 const Allocator = std.mem.Allocator;
 const AtomicUsize = std.atomic.Value(usize);
 
+fn toLowerAlloc(allocator: Allocator, input: []const u8) Allocator.Error![]u8 {
+    var out = try allocator.alloc(u8, input.len);
+    for (input, 0..) |ch, i| {
+        out[i] = std.ascii.toLower(ch);
+    }
+    return out;
+}
+
 pub const Access = enum(i8) {
     Default = -1,
     ReadWrite = 0,
@@ -75,7 +83,9 @@ pub const Root = struct {
         const parent_strongs = try allocator.alloc(*AtomicUsize, 1);
         errdefer allocator.free(parent_strongs);
 
-        const name_copy = try string_pool.intern(name);
+        const lower_name = try toLowerAlloc(allocator, name);
+        defer allocator.free(lower_name);
+        const name_copy = try string_pool.intern(lower_name);
 
         file.* = .{
             .allocator = allocator,
@@ -274,13 +284,36 @@ pub const Context = struct {
         var it = std.mem.splitScalar(u8, dotted, '.');
         while (it.next()) |segment| {
             if (segment.len == 0) continue;
-            if (current.retainClass(segment)) |child| {
+            const lower = try toLowerAlloc(self.root.allocator, segment);
+            defer self.root.allocator.free(lower);
+            if (current.retainClass(lower)) |child| {
                 current.release();
                 current = child;
                 continue;
             }
 
-            const created = try current.createClass(segment, null);
+            const created = try current.createClass(lower, null);
+            current.release();
+            current = created;
+        }
+
+        return current;
+    }
+
+    fn ensureClassPathCaseSensitive(self: *Context, dotted: []const u8) !*Context {
+        var current = self.retain();
+        errdefer current.release();
+
+        var it = std.mem.splitScalar(u8, dotted, '.');
+        while (it.next()) |segment| {
+            if (segment.len == 0) continue;
+            if (current.retainClassCaseSensitive(segment)) |child| {
+                current.release();
+                current = child;
+                continue;
+            }
+
+            const created = try current.createClassCaseSensitive(segment, null);
             current.release();
             current = created;
         }
@@ -301,13 +334,25 @@ pub const Context = struct {
     }
 
     pub fn set(self: *Context, name: []const u8, value: anytype) !void {
-        self.createValue(name, value, false) catch |err| switch (err) {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return;
+        defer self.root.allocator.free(lower);
+        try self.setCaseSensitive(lower, value);
+    }
+
+    fn setCaseSensitive(self: *Context, name: []const u8, value: anytype) !void {
+        self.createValueCaseSensitive(name, value, false) catch |err| switch (err) {
             error.ParameterAlreadyExists => return,
             else => return err,
         };
     }
 
     pub fn getI32(self: *Context, name: []const u8) ?i32 {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return null;
+        defer self.root.allocator.free(lower);
+        return self.getI32CaseSensitive(lower);
+    }
+
+    fn getI32CaseSensitive(self: *Context, name: []const u8) ?i32 {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
         if (self.params.get(name)) |par| {
@@ -320,6 +365,12 @@ pub const Context = struct {
     }
 
     pub fn getI64(self: *Context, name: []const u8) ?i64 {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return null;
+        defer self.root.allocator.free(lower);
+        return self.getI64CaseSensitive(lower);
+    }
+
+    fn getI64CaseSensitive(self: *Context, name: []const u8) ?i64 {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
         if (self.params.get(name)) |par| {
@@ -333,6 +384,12 @@ pub const Context = struct {
     }
 
     pub fn getF32(self: *Context, name: []const u8) ?f32 {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return null;
+        defer self.root.allocator.free(lower);
+        return self.getF32CaseSensitive(lower);
+    }
+
+    fn getF32CaseSensitive(self: *Context, name: []const u8) ?f32 {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
         if (self.params.get(name)) |par| {
@@ -345,6 +402,12 @@ pub const Context = struct {
     }
 
     pub fn getString(self: *Context, name: []const u8) ?[]const u8 {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return null;
+        defer self.root.allocator.free(lower);
+        return self.getStringCaseSensitive(lower);
+    }
+
+    fn getStringCaseSensitive(self: *Context, name: []const u8) ?[]const u8 {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
         if (self.params.get(name)) |par| {
@@ -357,6 +420,12 @@ pub const Context = struct {
     }
 
     pub fn getDeletionSource(self: *Context, name: []const u8) ?*const src.Source {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return null;
+        defer self.root.allocator.free(lower);
+        return self.getDeletionSourceCaseSensitive(lower);
+    }
+
+    fn getDeletionSourceCaseSensitive(self: *Context, name: []const u8) ?*const src.Source {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
         return self.deletions.get(name);
@@ -368,6 +437,12 @@ pub const Context = struct {
     }
 
     pub fn getValueByPath(self: *Context, path: []const u8) ?*values.Value {
+        const lower_path = toLowerAlloc(self.root.allocator, path) catch return null;
+        defer self.root.allocator.free(lower_path);
+        return self.getValueByPathCaseSensitive(lower_path);
+    }
+
+    fn getValueByPathCaseSensitive(self: *Context, path: []const u8) ?*values.Value {
         const last_dot: ?usize = std.mem.lastIndexOfScalar(u8, path, '.');
         var ctx: *Context = self;
         if (last_dot) |ld| {
@@ -524,7 +599,20 @@ pub const Context = struct {
         return self.children.get(name);
     }
 
+    fn getClassCaseInsensitive(self: *Context, name: []const u8) ?*Context {
+        const lower = toLowerAlloc(self.root.allocator, name) catch return null;
+        defer self.root.allocator.free(lower);
+        return self.children.get(lower);
+    }
+
     pub fn retainClass(self: *Context, name: []const u8) ?*Context {
+        if (self.getClassCaseInsensitive(name)) |child_ctx| {
+            return child_ctx.retain();
+        }
+        return null;
+    }
+
+    fn retainClassCaseSensitive(self: *Context, name: []const u8) ?*Context {
         if (self.getClass(name)) |child_ctx| {
             return child_ctx.retain();
         }
@@ -578,6 +666,12 @@ pub const Context = struct {
         return self.createClassWithSourceUnlocked(name, extends, null);
     }
 
+    fn createClassCaseSensitive(self: *Context, name: []const u8, extends: ?*Context) !*Context {
+        self.rw_lock.lock();
+        defer self.rw_lock.unlock();
+        return self.createClassWithSourceUnlockedCaseSensitive(name, extends, null);
+    }
+
     pub fn createClassWithSource(self: *Context, name: []const u8, extends: ?*Context, src_opt: ?*const src.Source) !*Context {
         self.rw_lock.lock();
         defer self.rw_lock.unlock();
@@ -587,6 +681,27 @@ pub const Context = struct {
     fn createClassWithSourceUnlocked(self: *Context, name: []const u8, extends: ?*Context, src_opt: ?*const src.Source) !*Context {
         const alloc = self.root.allocator;
 
+        const lower = try toLowerAlloc(alloc, name);
+        defer alloc.free(lower);
+
+        return self.createClassWithSourceUnlockedCaseSensitive(lower, extends, src_opt);
+    }
+
+    fn createClassWithSourceUnlockedCaseSensitive(self: *Context, name: []const u8, extends: ?*Context, src_opt: ?*const src.Source) !*Context {
+        const alloc = self.root.allocator;
+
+        if (self.children.get(name)) |existing| {
+            return existing.retain();
+        }
+
+        const owned_name = try self.root.spool.intern(name);
+
+        const gop = try self.children.getOrPut(owned_name);
+        if (gop.found_existing) {
+            return gop.value_ptr.*.retain();
+        }
+        errdefer _ = self.children.remove(owned_name);
+
         const child_ctx = try self.root.cpool.acquire();
         errdefer self.root.cpool.release(child_ctx);
 
@@ -595,22 +710,16 @@ pub const Context = struct {
 
         @memcpy(parent_strongs[1..], self.parent_refs);
 
-        const owned_name = try self.root.spool.intern(name);
-
-        const gop = try self.children.getOrPut(owned_name);
-        if (gop.found_existing) {
-            return error.NameAlreadyExists;
-        }
-        errdefer _ = self.children.remove(owned_name);
-
         child_ctx.* = .{ .name = gop.key_ptr.*, .access = .Default, .refs = AtomicUsize.init(1), .derivatives = AtomicUsize.init(0), .parent_refs = parent_strongs, .children = std.StringHashMap(*Context).init(alloc), .params = std.StringHashMap(*Parameter).init(alloc), .deletions = std.StringHashMap(*const src.Source).init(alloc), .root = self.root, .parent = self, .base = null, .source = src_opt };
-        child_ctx.deletions = std.StringHashMap(*const src.Source).init(alloc);
 
         child_ctx.parent_refs[0] = &child_ctx.refs;
         child_ctx.extendUnlocked(extends) catch |err| {
             _ = self.children.remove(owned_name);
             child_ctx.children.deinit();
             child_ctx.params.deinit();
+            child_ctx.deletions.deinit();
+            alloc.free(parent_strongs);
+            self.root.cpool.release(child_ctx);
             return err;
         };
 
@@ -625,7 +734,6 @@ pub const Context = struct {
         try self.removeClassWithSourceUnlocked(name, null);
     }
 
-    // Locked remove that records a source for provenance (kept for API symmetry).
     pub fn removeClassWithSource(self: *Context, name: []const u8, src_opt: ?*const src.Source) !void {
         self.rw_lock.lock();
         defer self.rw_lock.unlock();
@@ -641,6 +749,18 @@ pub const Context = struct {
             return error.WaitingOnRemoval;
         }
 
+        const alloc = self.root.allocator;
+        const lower = try toLowerAlloc(alloc, name);
+        defer alloc.free(lower);
+
+        return self.removeClassWithSourceUnlockedCaseSensitive(lower, src_opt);
+    }
+
+    fn removeClassWithSourceUnlockedCaseSensitive(self: *Context, name: []const u8, src_opt: ?*const src.Source) !void {
+        if (self.removed) {
+            return error.WaitingOnRemoval;
+        }
+
         if (self.children.get(name)) |child_ctx| {
             if (child_ctx.derivatives.load(.acquire) > 0) {
                 return error.ClassHasDerivatives;
@@ -650,12 +770,10 @@ pub const Context = struct {
                 removed_entry.value.removed = true;
                 removed_entry.value.release();
 
-                // Record provenance for deletion
                 const owned_name = try self.root.spool.intern(name);
                 if (src_opt) |src_ref| {
                     _ = try self.deletions.put(owned_name, src_ref);
                 } else {
-                    // If no source, remove any existing record
                     _ = self.deletions.remove(owned_name);
                 }
 
@@ -672,6 +790,12 @@ pub const Context = struct {
         return self.createValueWithSourceUnlocked(name, value, protect, null);
     }
 
+    fn createValueCaseSensitive(self: *Context, name: []const u8, value: anytype, protect: bool) !void {
+        self.rw_lock.lock();
+        defer self.rw_lock.unlock();
+        return self.createValueWithSourceUnlockedCaseSensitive(name, value, protect, null);
+    }
+
     pub fn createValueWithSource(self: *Context, name: []const u8, value: anytype, protect: bool, src_opt: ?*const src.Source) !void {
         self.rw_lock.lock();
         defer self.rw_lock.unlock();
@@ -679,6 +803,19 @@ pub const Context = struct {
     }
 
     fn createValueWithSourceUnlocked(self: *Context, name: []const u8, value: anytype, protect: bool, src_opt: ?*const src.Source) !void {
+        if (self.removed) {
+            return error.WaitingOnRemoval;
+        }
+
+        const alloc = self.root.allocator;
+
+        const lower = try toLowerAlloc(alloc, name);
+        defer alloc.free(lower);
+
+        return self.createValueWithSourceUnlockedCaseSensitive(lower, value, protect, src_opt);
+    }
+
+    fn createValueWithSourceUnlockedCaseSensitive(self: *Context, name: []const u8, value: anytype, protect: bool, src_opt: ?*const src.Source) !void {
         if (self.removed) {
             return error.WaitingOnRemoval;
         }
@@ -704,8 +841,7 @@ pub const Context = struct {
             found.value.deinit(alloc);
             found.value = owned_value;
             found.source = src_opt;
-
-            return error.ParameterAlreadyExists;
+            return;
         }
 
         const par = try self.root.parpool.acquire();
@@ -732,7 +868,10 @@ pub const Context = struct {
         }
 
         if (new_extends) |new| {
-            if (new == self) return error.CircularDependency;
+            if (new == self) {
+                std.log.warn("Circular dependency detected on class {s} with extends {s}", .{ self.name, new.name });
+                return error.CircularDependency;
+            }
 
             var current: ?*Context = new.base;
 
@@ -740,6 +879,7 @@ pub const Context = struct {
             defer new.rw_lock.unlockShared();
             while (current) |ctx| {
                 if (ctx == self) {
+                    std.log.warn("Circular dependency detected on class {s} with extends {s}", .{ self.name, new.name });
                     return error.CircularDependency;
                 }
 
@@ -758,6 +898,41 @@ pub const Context = struct {
         } else {
             self.base = null;
         }
+    }
+
+    fn findChildUnlocked(self: *Context, name: []const u8, parent: bool, base: bool, exclude: ?*Context) !?*Context {
+        const alloc = self.root.allocator;
+
+        const lower = try toLowerAlloc(alloc, name);
+        defer alloc.free(lower);
+
+        return self.findChildLoweredUnlocked(lower, parent, base, exclude);
+    }
+
+    fn findChildLoweredUnlocked(self: *Context, lower: []const u8, parent: bool, base: bool, exclude: ?*Context) ?*Context {
+        if (self.children.get(lower)) |child| {
+            if (exclude) |ex| {
+                if (child != ex) {
+                    return child;
+                }
+            } else {
+                return child;
+            }
+        }
+
+        if (base and self.base != null) {
+            if (self.base.?.findChildLoweredUnlocked(lower, parent, true, exclude)) |child| {
+                return child;
+            }
+        }
+
+        if (parent and self.parent != null) {
+            if (self.parent.?.findChildLoweredUnlocked(lower, true, base, exclude)) |child| {
+                return child;
+            }
+        }
+
+        return null;
     }
 
     pub fn parse(self: *Context, source: src.Source, protect: bool) !void {
@@ -790,7 +965,6 @@ pub const Context = struct {
             return error.AccessDenied;
         }
 
-        // Pre-reserve rough capacities to reduce hashmap rehashing during bulk updates.
         var class_count: usize = 0;
         var param_count: usize = 0;
         for (nodes) |n| {
@@ -815,24 +989,32 @@ pub const Context = struct {
                 },
                 .class => |class_node| {
                     var child_ctx: *Context = undefined;
-                    if (self.children.get(class_node.name)) |existing| {
+                    const lower = try toLowerAlloc(alloc, class_node.name);
+                    defer alloc.free(lower);
+                    if (self.children.get(lower)) |existing| {
                         child_ctx = existing.retain();
                     } else {
-                        child_ctx = try self.createClassWithSourceUnlocked(class_node.name, null, src_opt);
+                        child_ctx = try self.createClassWithSourceUnlockedCaseSensitive(lower, null, src_opt);
                     }
 
+                    defer child_ctx.release();
+
                     if (class_node.extends) |_| {
-                        // TODO: resolve extends
+                        const entry = try self.findChildUnlocked(class_node.extends.?, true, true, child_ctx);
+                        if (entry == null) {
+                            std.log.warn("[{s}] Couldnt find {s} for class {s} in context {s}", .{ src_opt.?.name, class_node.extends.?, class_node.name, self.name });
+                        }
+                        try child_ctx.extendUnlocked(entry orelse return error.BaseClassNotFound);
                     }
                     var empty_nodes = [_]ast.AstNode{};
                     const child_nodes: []ast.AstNode = class_node.nodes orelse &empty_nodes;
 
                     try child_ctx.updateWithSourceUnlocked(child_nodes, protect, src_opt);
-
-                    child_ctx.release();
                 },
                 .param => |*param_node| {
-                    if (std.mem.eql(u8, param_node.name, "access")) {
+                    const lower = try toLowerAlloc(alloc, param_node.name);
+                    defer alloc.free(lower);
+                    if (std.mem.eql(u8, lower, "access")) {
                         if (self.access == .Default) {
                             const parsed_access = switch (param_node.value.data.i32) {
                                 0 => Access.ReadWrite,
@@ -844,11 +1026,10 @@ pub const Context = struct {
                             self.access = parsed_access;
                         }
                     } else {
-                        // Move value out of AST to avoid clone; neutralize in AST so its deinit is no-op.
                         var moved_value = param_node.value;
                         param_node.value = .{ .data = .{ .i32 = 0 } };
                         moved_value.source = moved_value.source orelse src_opt;
-                        try self.createValueWithSourceUnlocked(param_node.name, moved_value, protect, src_opt);
+                        try self.createValueWithSourceUnlockedCaseSensitive(lower, moved_value, protect, src_opt);
                     }
                 },
                 .array => |*array_node| {
@@ -858,50 +1039,51 @@ pub const Context = struct {
 
                     switch (array_node.operator) {
                         .Add => {
-                            const found: ?*Parameter = self.params.get(array_node.name);
+                            const lower = try toLowerAlloc(alloc, array_node.name);
+                            defer alloc.free(lower);
+                            const found: ?*Parameter = self.params.get(lower);
                             if (found) |par| {
                                 if (par.value.data != .array) {
                                     return error.TypeMismatch;
                                 }
 
-                                // Move items without cloning
                                 for (array_node.value.values.items) |*item| {
                                     var moved_item = item.*;
                                     item.* = .{ .data = .{ .i32 = 0 } };
                                     moved_item.source = moved_item.source orelse src_opt;
                                     try par.value.data.array.values.append(moved_item);
                                 }
-                                // Free the AST array buffer now that items are moved
                                 array_node.value.deinit(alloc);
                                 array_node.value = values.Array.init(alloc);
                             } else {
-                                // Move entire array into new parameter
-                                const moved_arr = array_node.value; // value moved
+                                const moved_arr = array_node.value;
                                 array_node.value = values.Array.init(alloc);
                                 for (moved_arr.values.items) |*it| it.source = it.source orelse src_opt;
-                                try self.createValueWithSourceUnlocked(array_node.name, values.Value{ .data = .{ .array = moved_arr } }, protect, src_opt);
+                                try self.createValueWithSourceUnlockedCaseSensitive(lower, values.Value{ .data = .{ .array = moved_arr } }, protect, src_opt);
                             }
                         },
                         .Sub => {
                             return error.NotImplemented;
                         },
                         .Assign => {
-                            const found: ?*Parameter = self.params.get(array_node.name);
+                            const lower2 = try toLowerAlloc(alloc, array_node.name);
+                            defer alloc.free(lower2);
+                            const found: ?*Parameter = self.params.get(lower2);
                             if (found) |par| {
                                 if (par.value.data != .array) {
                                     return error.TypeMismatch;
                                 }
                                 par.value.data.array.deinit(alloc);
-                                const moved_arr = array_node.value; // value moved
+                                const moved_arr = array_node.value;
                                 array_node.value = values.Array.init(alloc);
                                 for (moved_arr.values.items) |*it| it.source = it.source orelse src_opt;
                                 par.value.data.array = moved_arr;
                                 par.source = src_opt;
                             } else {
-                                const moved_arr2 = array_node.value; // value moved
+                                const moved_arr2 = array_node.value;
                                 array_node.value = values.Array.init(alloc);
                                 for (moved_arr2.values.items) |*it| it.source = it.source orelse src_opt;
-                                try self.createValueWithSourceUnlocked(array_node.name, values.Value{ .data = .{ .array = moved_arr2 } }, protect, src_opt);
+                                try self.createValueWithSourceUnlockedCaseSensitive(lower2, values.Value{ .data = .{ .array = moved_arr2 } }, protect, src_opt);
                             }
                         },
                     }

@@ -75,7 +75,7 @@ test "[param] create/remove classes and derivative guard" {
     try root_ctx.removeClass("Base");
 }
 
-test "[param] duplicate class name error" {
+test "[param] creating duplicate class returns existing (no error)" {
     const root: *Root = try Root.create("config", testing.allocator);
     defer root.release();
 
@@ -85,7 +85,10 @@ test "[param] duplicate class name error" {
     var a = try root_ctx.createClass("Dup", null);
     defer a.release();
 
-    try testing.expectError(error.NameAlreadyExists, root_ctx.createClass("Dup", null));
+    var b = try root_ctx.createClass("Dup", null);
+    defer b.release();
+
+    try testing.expect(a == b);
 }
 
 test "[param] removeClass on non-existent class returns ClassNotFound" {
@@ -129,7 +132,7 @@ test "[param] Context.getPath and nested classes" {
 
     const path = try C.getPath(testing.allocator);
     defer testing.allocator.free(path);
-    try testing.expectEqualStrings("config.A.B.C", path);
+    try testing.expectEqualStrings("config.a.b.c", path);
 }
 
 test "[param] Parameter.getPath for nested arrays" {
@@ -222,7 +225,7 @@ test "[param] Context.toSyntax contains class and params" {
     try cx.createValue("foo", 2, false);
     const txt = try cx.toSyntax(testing.allocator, 0);
     defer testing.allocator.free(txt);
-    try testing.expect(std.mem.indexOf(u8, txt, "class ForSyntax") != null);
+    try testing.expect(std.mem.indexOf(u8, txt, "class forsyntax") != null);
     try testing.expect(std.mem.indexOf(u8, txt, "foo = 2;") != null);
 }
 
@@ -254,7 +257,7 @@ test "[param] parsing creates classes and params in root context" {
     root_ctx.rw_lock.lockShared();
     defer root_ctx.rw_lock.unlockShared();
 
-    try testing.expect(root_ctx.children.get("A") != null);
+    try testing.expect(root_ctx.children.get("a") != null);
     const par_opt = root_ctx.params.get("foo");
     try testing.expect(par_opt != null);
     try testing.expect(par_opt.?.value.getNumber() == 42);
@@ -280,14 +283,14 @@ test "[param] parsing nested classes and parameters" {
     root_ctx.rw_lock.lockShared();
     defer root_ctx.rw_lock.unlockShared();
 
-    const A_opt = root_ctx.children.get("A");
+    const A_opt = root_ctx.children.get("a");
     try testing.expect(A_opt != null);
     const A = A_opt.?;
 
     const d_opt = A.params.get("d");
     try testing.expect(d_opt != null);
 
-    const B_opt = A.children.get("B");
+    const B_opt = A.children.get("b");
     try testing.expect(B_opt != null);
     const B = B_opt.?;
 
@@ -359,7 +362,7 @@ test "[param] parsing delete removes class" {
 
     root_ctx.rw_lock.lockShared();
     defer root_ctx.rw_lock.unlockShared();
-    try testing.expect(root_ctx.children.get("X") == null);
+    try testing.expect(root_ctx.children.get("x") == null);
 }
 
 test "[param] deletions tracked by source" {
@@ -385,7 +388,7 @@ test "[param] deletions tracked by source" {
 
     root_ctx.rw_lock.lockShared();
     defer root_ctx.rw_lock.unlockShared();
-    const del_src_opt = root_ctx.deletions.get("A");
+    const del_src_opt = root_ctx.deletions.get("a");
     try testing.expect(del_src_opt != null);
     try testing.expectEqualStrings("s3", del_src_opt.?.name);
 
@@ -394,7 +397,7 @@ test "[param] deletions tracked by source" {
     defer it.deinit();
     const first = it.next();
     try testing.expect(first != null);
-    try testing.expectEqualStrings("A", first.?.name);
+    try testing.expectEqualStrings("a", first.?.name);
     try testing.expectEqualStrings("s3", first.?.source.name);
 }
 
@@ -426,7 +429,7 @@ test "[param] parse from file: simple.cpp" {
 
     root_ctx.rw_lock.lockShared();
     defer root_ctx.rw_lock.unlockShared();
-    try testing.expect(root_ctx.children.get("A") != null);
+    try testing.expect(root_ctx.children.get("a") != null);
     const par_opt = root_ctx.params.get("foo");
     try testing.expect(par_opt != null);
     try testing.expect(par_opt.?.value.getNumber() == 42);
@@ -449,12 +452,12 @@ test "[param] parse from file: nested.cpp" {
 
     root_ctx.rw_lock.lockShared();
     defer root_ctx.rw_lock.unlockShared();
-    const A_opt = root_ctx.children.get("A");
+    const A_opt = root_ctx.children.get("a");
     try testing.expect(A_opt != null);
     const A = A_opt.?;
     const d_opt = A.params.get("d");
     try testing.expect(d_opt != null);
-    const B_opt = A.children.get("B");
+    const B_opt = A.children.get("b");
     try testing.expect(B_opt != null);
     const B = B_opt.?;
     const c_opt = B.params.get("c");

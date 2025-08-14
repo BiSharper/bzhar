@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     cli_exe.root_module.addImport("param", param_mod);
     cli_exe.root_module.addImport("mempools", mempools_mod);
     cli_exe.root_module.addImport("fileutil", fileutil_mod);
+    cli_exe.root_module.addImport("lzss", lzss_mod);
 
     b.installArtifact(cli_exe);
 
