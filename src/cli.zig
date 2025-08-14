@@ -1,8 +1,12 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const param = @import("param");
+const lzss = @import("lzss");
 
-pub const Handler = *const fn (*Shell, [][]const u8) anyerror!void;
+// Core Types and Structures
+
+pub const Handler = *const fn (*Shell, []const []const u8) anyerror!void;
 
 pub const CommandSpec = struct {
     name: []const u8,
@@ -14,534 +18,612 @@ pub const ModuleSpec = struct {
     name: []const u8,
     prompt: []const u8,
     commands: []const CommandSpec,
+};
 
-    pub fn init(allocator: Allocator, name: []const u8, prompt: []const u8, commands: []const CommandSpec) !ModuleSpec {
-        return ModuleSpec{
-            .name = try allocator.dupe(u8, name),
-            .prompt = try allocator.dupe(u8, prompt),
-            .commands = try allocator.dupe(CommandSpec, commands),
+// Command Definitions
+
+pub const Modules = &[_]ModuleSpec{
+    .{ .name = "lzss", .prompt = "lzss> ", .commands = lzssCommands },
+    .{ .name = "param", .prompt = "param> ", .commands = paramCommands },
+};
+
+pub const lzssCommands = &[_]CommandSpec{
+    .{ .name = "compress", .help = "[text|file]=value <path>", .handler = compressCommand },
+    .{ .name = "drycompress", .help = "[text|file]=value count [--roundtrip] [--output-errored=path]", .handler = dryCompressCommand },
+};
+
+pub const paramCommands = &[_]CommandSpec{
+    .{ .name = "config", .help = "create/delete/select [context_path]", .handler = paramConfigCommand },
+    .{ .name = "context", .help = "create/delete/select/list [name] [path]", .handler = paramContextCommand },
+    .{ .name = "load", .help = "<file_path> [config_name]", .handler = paramLoadCommand },
+    .{ .name = "dryload", .help = "<file_path> [--benchmark=N]", .handler = paramDryloadCommand },
+    .{ .name = "list", .help = "<configs|contexts>", .handler = paramListCommand },
+    .{ .name = "status", .help = "", .handler = paramStatusCommand },
+    .{ .name = "source", .help = "[context_path]", .handler = paramSourceCommand },
+};
+
+// State Management
+
+const DEFAULT_CONFIG_NAME: []const u8 = "default";
+const ROOT_CONTEXT_NAME: []const u8 = "<none>";
+
+const State = struct {
+    configs: std.StringHashMap(*param.Root),
+    selected_config: ?[]const u8,
+    selected_context: ?[]const u8,
+    selected_context_ptr: ?*param.Context,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) State {
+        return .{
+            .configs = std.StringHashMap(*param.Root).init(allocator),
+            .selected_config = null,
+            .selected_context = null,
+            .selected_context_ptr = null,
+            .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *ModuleSpec, allocator: Allocator) void {
-        allocator.free(self.name);
-        allocator.free(self.prompt);
-        allocator.free(self.commands);
-    }
-};
+    pub fn deinit(self: *State) void {
+        var iter = self.configs.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.*.release();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.configs.deinit();
 
-pub fn defineCommand(comptime name: []const u8, comptime help: []const u8, comptime handler: Handler) CommandSpec {
-    return .{ .name = name, .help = help, .handler = handler };
-}
-
-pub fn defineModule(comptime name: []const u8, comptime prompt: []const u8, comptime commands: []const CommandSpec) ModuleSpec {
-    return .{ .name = name, .prompt = prompt, .commands = commands };
-}
-
-fn rootCd(shell: *Shell, args: [][]const u8) !void {
-    if (args.len == 0) {
-        try shell.stdout.print("Usage: cd <directory>\n", .{});
-        return;
-    }
-
-    const target = args[0];
-
-    var target_dir = std.fs.cwd().openDir(target, .{}) catch |err| {
-        try shell.stdout.print("Error changing directory to '{s}': {}\n", .{ target, err });
-        return;
-    };
-    defer target_dir.close();
-
-    target_dir.setAsCwd() catch |err| {
-        try shell.stdout.print("Error setting '{s}' as current directory: {}\n", .{ target, err });
-        return;
-    };
-
-    if (shell.cwd) |old_cwd| {
-        shell.allocator.free(old_cwd);
-    }
-    shell.cwd = try shell.getCurrentWorkingDir();
-    try shell.stdout.print("Changed to: {s}\n", .{shell.cwd.?});
-}
-
-fn rootPwd(shell: *Shell, args: [][]const u8) !void {
-    _ = args;
-    if (shell.cwd) |cwd| {
-        try shell.stdout.print("{s}\n", .{cwd});
-    } else {
-        try shell.stdout.print("Unknown working directory\n", .{});
-    }
-}
-
-pub const Modules = &[_]ModuleSpec{ defineModule("lzss", "lzss> ", lzssCommands), defineModule("param", "param> ", paramCommands) };
-
-pub const lzssCommands = &[_]CommandSpec{defineCommand("compress", "[text|file]=value <path>", compressCommand)};
-pub const paramCommands = &[_]CommandSpec{
-    defineCommand("config", "create/delete/select [name]", paramConfigCommand),
-    defineCommand("context", "create/delete/select/list [name]", paramContextCommand),
-    defineCommand("load", "<file_path> [config_name]", paramLoadCommand),
-    defineCommand("dryload", "<file_path> [--benchmark=N]", paramDryloadCommand),
-    defineCommand("list", "<configs|contexts>", paramListCommand),
-    defineCommand("status", "", paramStatusCommand),
-};
-
-fn compressCommand(shell: *Shell, args: [][]const u8) !void {
-    if (args.len == 0) {
-        try shell.stdout.print("Check help for usage\n", .{});
-        return;
-    }
-
-    return;
-}
-const param = @import("param");
-
-pub var Configs: ?*std.StringHashMap(*param.Root) = null;
-pub var SelectedConfig: ?[]const u8 = null;
-pub var SelectedContext: ?[]const u8 = null;
-
-pub var SelectedContextPtr: ?*param.Context = null;
-
-fn getConfigs() *std.StringHashMap(*param.Root) {
-    if (Configs) |configs| {
-        return configs;
-    }
-
-    Configs = std.heap.page_allocator.create(std.StringHashMap(*param.Root)) catch unreachable;
-    Configs.?.* = std.StringHashMap(*param.Root).init(std.heap.page_allocator);
-    return Configs.?;
-}
-
-fn getParam(alloc: Allocator) !*param.Root {
-    const configs = getConfigs();
-    if (SelectedConfig) |config_name| {
-        if (configs.get(config_name)) |root| {
-            return root;
+        if (self.selected_context_ptr) |ptr| {
+            ptr.release();
         }
     }
 
-    const default_name = "default";
-    if (configs.get(default_name)) |root| {
-        SelectedConfig = default_name;
+    pub fn getOrCreateDefaultConfig(self: *State) !*param.Root {
+        if (self.selected_config) |config_name| {
+            if (self.configs.get(config_name)) |root| {
+                return root;
+            }
+        }
+
+        const default_name = DEFAULT_CONFIG_NAME;
+        if (self.configs.get(default_name)) |root| {
+            self.selected_config = default_name;
+            return root;
+        }
+
+        const root = try param.Root.create(default_name, self.allocator);
+        const name_copy = try self.allocator.dupe(u8, default_name);
+        try self.configs.put(name_copy, root);
+        self.selected_config = default_name;
         return root;
     }
 
-    const root = try param.Root.create(default_name, alloc);
-    const name_copy = try alloc.dupe(u8, default_name);
-    try configs.put(name_copy, root);
-    SelectedConfig = default_name;
-    return root;
+    pub fn selectConfig(self: *State, name: []const u8) !void {
+        if (self.configs.get(name)) |root| {
+            self.selected_config = name;
+
+            self.selected_context = ROOT_CONTEXT_NAME;
+            if (self.selected_context_ptr) |ptr| {
+                ptr.release();
+            }
+            self.selected_context_ptr = root.retain();
+        } else {
+            return error.ConfigNotFound;
+        }
+    }
+
+    pub fn createConfig(self: *State, name: []const u8) !void {
+        if (self.configs.get(name)) |_| {
+            return error.ConfigAlreadyExists;
+        }
+
+        const root = try param.Root.create(name, self.allocator);
+        const name_copy = try self.allocator.dupe(u8, name);
+        try self.configs.put(name_copy, root);
+
+        if (self.selected_config == null) {
+            self.selected_config = name;
+            self.selected_context = ROOT_CONTEXT_NAME;
+            self.selected_context_ptr = root.retain();
+        }
+    }
+
+    pub fn deleteConfig(self: *State, name: []const u8) !void {
+        if (self.configs.get(name)) |root| {
+            root.release();
+            _ = self.configs.remove(name);
+
+            if (self.selected_config) |selected| {
+                if (std.mem.eql(u8, selected, name)) {
+                    self.selected_config = null;
+                    self.selected_context = null;
+                    if (self.selected_context_ptr) |p| {
+                        p.release();
+                        self.selected_context_ptr = null;
+                    }
+                }
+            }
+        } else {
+            return error.ConfigNotFound;
+        }
+    }
+};
+
+// Utility Functions
+
+fn printUsage(shell: *Shell, usage: []const u8) !void {
+    try shell.stdout.print("Usage: {s}\n", .{usage});
 }
 
-fn paramConfigCommand(shell: *Shell, args: [][]const u8) !void {
+fn printError(shell: *Shell, comptime fmt: []const u8, args: anytype) !void {
+    try shell.stdout.print("Error: " ++ fmt ++ "\n", args);
+}
+
+fn printSuccess(shell: *Shell, comptime fmt: []const u8, args: anytype) !void {
+    try shell.stdout.print(fmt ++ "\n", args);
+}
+
+fn navigateToContext(root_ctx: *param.Context, path: []const u8) ?*param.Context {
+    if (std.mem.indexOfScalar(u8, path, '.')) |_| {
+        var path_parts = std.mem.splitScalar(u8, path, '.');
+        var current = root_ctx;
+
+        while (path_parts.next()) |segment| {
+            if (segment.len == 0) continue;
+
+            current.rw_lock.lockShared();
+            const child_opt = current.children.get(segment);
+            current.rw_lock.unlockShared();
+
+            if (child_opt) |child| {
+                current = child;
+            } else {
+                return null;
+            }
+        }
+        return current;
+    } else {
+        root_ctx.rw_lock.lockShared();
+        defer root_ctx.rw_lock.unlockShared();
+        return root_ctx.children.get(path);
+    }
+}
+
+// Command Implementations
+
+fn compressCommand(shell: *Shell, args: []const []const u8) !void {
+    if (args.len == 0) {
+        try printUsage(shell, "compress <text|file> <path>");
+        return;
+    }
+    // TODO: Implement compression logic
+    try printSuccess(shell, "Compression not yet implemented", .{});
+}
+
+fn dryCompressCommand(shell: *Shell, args: []const []const u8) !void {
     if (args.len < 2) {
-        try shell.stdout.print("Usage: config <create|delete|select> [name]\n", .{});
+        try printUsage(shell, "drycompress [text|file]=value count [--roundtrip] [--output-errored=path]");
+        return;
+    }
+
+    const input_spec = args[0];
+    const count_str = args[1];
+    
+    var roundtrip = false;
+    var output_errored_path: ?[]const u8 = null;
+    
+    // Parse optional flags
+    var arg_idx: usize = 2;
+    while (arg_idx < args.len) : (arg_idx += 1) {
+        const arg = args[arg_idx];
+        if (std.mem.eql(u8, arg, "--roundtrip")) {
+            roundtrip = true;
+        } else if (std.mem.startsWith(u8, arg, "--output-errored=")) {
+            output_errored_path = arg["--output-errored=".len..];
+        } else {
+            try printError(shell, "Unknown option: {s}", .{arg});
+            return;
+        }
+    }
+
+    const count = std.fmt.parseInt(usize, count_str, 10) catch {
+        try printError(shell, "Invalid count value: {s}", .{count_str});
+        return;
+    };
+
+    if (count == 0) {
+        try printError(shell, "Count must be greater than 0", .{});
+        return;
+    }
+
+    // Parse [text|file]=value format
+    const equals_pos = std.mem.indexOfScalar(u8, input_spec, '=');
+    if (equals_pos == null) {
+        try printError(shell, "Invalid format. Use '[text|file]=value'", .{});
+        return;
+    }
+
+    const input_type = input_spec[0..equals_pos.?];
+    const contents = input_spec[equals_pos.? + 1 ..];
+
+    var input_data: []const u8 = undefined;
+    var is_file = false;
+    var file_buffer: ?[]u8 = null;
+
+    if (std.ascii.eqlIgnoreCase(input_type, "file")) {
+        is_file = true;
+        // Read file contents
+        const file = std.fs.cwd().openFile(contents, .{}) catch |err| {
+            try printError(shell, "Failed to open file '{s}': {s}", .{ contents, @errorName(err) });
+            return;
+        };
+        defer file.close();
+
+        const stat = file.stat() catch |err| {
+            try printError(shell, "Failed to stat file '{s}': {s}", .{ contents, @errorName(err) });
+            return;
+        };
+
+        file_buffer = shell.allocator.alloc(u8, stat.size) catch |err| {
+            try printError(shell, "Failed to allocate memory for file: {s}", .{@errorName(err)});
+            return;
+        };
+        defer if (file_buffer) |buf| shell.allocator.free(buf);
+
+        const bytes_read = file.readAll(file_buffer.?) catch |err| {
+            try printError(shell, "Failed to read file '{s}': {s}", .{ contents, @errorName(err) });
+            return;
+        };
+
+        if (bytes_read != stat.size) {
+            try printError(shell, "Failed to read entire file. Expected {d} bytes, got {d}", .{ stat.size, bytes_read });
+            return;
+        }
+
+        input_data = file_buffer.?;
+    } else if (std.ascii.eqlIgnoreCase(input_type, "text")) {
+        input_data = contents;
+    } else {
+        try printError(shell, "Invalid input type: {s}. Use 'text' or 'file'", .{input_type});
+        return;
+    }
+
+    var totals_ns: u128 = 0;
+    var min_ns: u128 = std.math.maxInt(u128);
+    var last_compressed_size: usize = 0;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        var timer = try std.time.Timer.start();
+
+        const compressed = lzss.encode(shell.allocator, input_data, false) catch |err| {
+            try printError(shell, "Compression failed: {s}", .{@errorName(err)});
+            return;
+        };
+        defer shell.allocator.free(compressed);
+
+        if (roundtrip) {
+            const decompressed = lzss.decode(shell.allocator, compressed, input_data.len, false) catch |err| {
+                try printError(shell, "Decompression failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer shell.allocator.free(decompressed);
+
+            // Verify roundtrip integrity
+            if (!std.mem.eql(u8, input_data, decompressed)) {
+                if (output_errored_path) |path| {
+                    // Write the mismatched decompressed data to the specified file
+                    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+                        try printError(shell, "Failed to create output file '{s}': {s}", .{ path, @errorName(err) });
+                        return;
+                    };
+                    defer file.close();
+                    
+                    file.writeAll(decompressed) catch |err| {
+                        try printError(shell, "Failed to write to output file '{s}': {s}", .{ path, @errorName(err) });
+                        return;
+                    };
+                    
+                    try printError(shell, "Roundtrip verification failed: data mismatch. Decompressed data written to '{s}'", .{path});
+                } else {
+                    try printError(shell, "Roundtrip verification failed: data mismatch", .{});
+                }
+                return;
+            }
+        }
+
+        last_compressed_size = compressed.len;
+        const elapsed_ns = timer.read();
+        totals_ns += elapsed_ns;
+        if (elapsed_ns < min_ns) min_ns = elapsed_ns;
+    }
+
+    if (count > 1) {
+        const avg_ns = totals_ns / count;
+        const compression_ratio = if (input_data.len > 0)
+            @as(f64, @floatFromInt(last_compressed_size)) / @as(f64, @floatFromInt(input_data.len))
+        else
+            0.0;
+
+        const roundtrip_text = if (roundtrip) " + roundtrip" else "";
+        try printSuccess(shell, "[drycompress] {d} iters  min {d} ms, avg {d} ms, ratio {d:.3}{s}", .{
+            count,
+            @as(u64, @intCast(min_ns / 1_000_000)),
+            @as(u64, @intCast(avg_ns / 1_000_000)),
+            compression_ratio,
+            roundtrip_text,
+        });
+    } else {
+        const compression_ratio = if (input_data.len > 0)
+            @as(f64, @floatFromInt(last_compressed_size)) / @as(f64, @floatFromInt(input_data.len))
+        else
+            0.0;
+
+        const roundtrip_text = if (roundtrip) " + roundtrip" else "";
+        try printSuccess(shell, "[drycompress] compressed {s} (ratio: {d:.3}){s}", .{ if (is_file) contents else "text", compression_ratio, roundtrip_text });
+    }
+}
+
+fn paramConfigCommand(shell: *Shell, args: []const []const u8) !void {
+    if (args.len < 2) {
+        try printUsage(shell, "config <create|delete|select> [name] [context_path]");
         return;
     }
 
     const action = args[0];
-    const name = if (args.len > 1) args[1] else "";
+    const name = args[1];
+    const context_path = if (args.len > 2) args[2] else null;
 
-    const configs = getConfigs();
+    const state = shell.getState();
 
     if (std.ascii.eqlIgnoreCase(action, "create")) {
-        if (name.len == 0) {
-            try shell.stdout.print("Usage: config create <name>\n", .{});
-            return;
-        }
-
-        if (configs.get(name)) |_| {
-            try shell.stdout.print("Config '{s}' already exists\n", .{name});
-            return;
-        }
-
-        const root = try param.Root.create(name, shell.allocator);
-        const name_copy = try shell.allocator.dupe(u8, name);
-        try configs.put(name_copy, root);
-        try shell.stdout.print("Created config: {s}\n", .{name});
+        state.createConfig(name) catch |err| switch (err) {
+            error.ConfigAlreadyExists => try printError(shell, "Config '{s}' already exists", .{name}),
+            else => return err,
+        };
+        try printSuccess(shell, "Created config: {s}", .{name});
     } else if (std.ascii.eqlIgnoreCase(action, "delete")) {
-        if (name.len == 0) {
-            try shell.stdout.print("Usage: config delete <name>\n", .{});
-            return;
-        }
-
-        if (configs.get(name)) |root| {
-            root.release();
-
-            var key_to_free: ?[]const u8 = null;
-            var iter = configs.iterator();
-            while (iter.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, name)) {
-                    key_to_free = entry.key_ptr.*;
-                    break;
-                }
-            }
-
-            _ = configs.remove(name);
-
-            if (key_to_free) |key| {
-                shell.allocator.free(key);
-            }
-
-            if (SelectedConfig) |selected| {
-                if (std.mem.eql(u8, selected, name)) {
-                    SelectedConfig = null;
-                    SelectedContext = null;
-                    if (SelectedContextPtr) |p| {
-                        p.release();
-                        SelectedContextPtr = null;
-                    }
-                }
-            }
-
-            try shell.stdout.print("Deleted config: {s}\n", .{name});
-        } else {
-            try shell.stdout.print("Config '{s}' not found\n", .{name});
-        }
+        state.deleteConfig(name) catch |err| switch (err) {
+            error.ConfigNotFound => try printError(shell, "Config '{s}' not found", .{name}),
+            else => return err,
+        };
+        try printSuccess(shell, "Deleted config: {s}", .{name});
     } else if (std.ascii.eqlIgnoreCase(action, "select")) {
-        if (name.len == 0) {
-            try shell.stdout.print("Usage: config select <name>\n", .{});
-            return;
-        }
+        state.selectConfig(name) catch |err| switch (err) {
+            error.ConfigNotFound => try printError(shell, "Config '{s}' not found", .{name}),
+            else => return err,
+        };
+        try printSuccess(shell, "Selected config: {s}", .{name});
 
-        if (configs.get(name)) |_| {
-            var it = configs.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, name)) {
-                    SelectedConfig = entry.key_ptr.*;
-                    break;
-                }
+        if (context_path) |path| {
+            const root = state.configs.get(name).?;
+            const root_ctx = root.retain();
+            defer root_ctx.release();
+
+            if (navigateToContext(root_ctx, path)) |target_ctx| {
+                state.selected_context = path;
+                state.selected_context_ptr = target_ctx.retain();
+                try printSuccess(shell, "Selected context: {s}", .{path});
+            } else {
+                try printError(shell, "Context path '{s}' not found in config '{s}'", .{ path, name });
             }
-            SelectedContext = null;
-            if (SelectedContextPtr) |p| {
-                p.release();
-                SelectedContextPtr = null;
-            }
-            try shell.stdout.print("Selected config: {s}\n", .{name});
-        } else {
-            try shell.stdout.print("Config '{s}' not found\n", .{name});
         }
     } else {
-        try shell.stdout.print("Unknown action: {s}. Use create, delete, or select\n", .{action});
+        try printError(shell, "Unknown action: {s}. Use create, delete, or select", .{action});
     }
 }
 
-fn paramContextCommand(shell: *Shell, args: [][]const u8) !void {
+fn paramContextCommand(shell: *Shell, args: []const []const u8) !void {
     if (args.len < 1) {
-        try shell.stdout.print("Usage: context <create|delete|select|list> [name]\n", .{});
+        try printUsage(shell, "context <create|delete|select|list> [name]");
         return;
     }
 
     const action = args[0];
     const name = if (args.len > 1) args[1] else "";
+    const state = shell.getState();
 
     if (std.ascii.eqlIgnoreCase(action, "create")) {
         if (name.len == 0) {
-            try shell.stdout.print("Usage: context create <name>\n", .{});
+            try printUsage(shell, "context create <name>");
             return;
         }
 
-        const configs = getConfigs();
-
-        if (SelectedConfig) |config_name| {
-            if (configs.get(config_name)) |root| {
-                const root_ctx = root.retain();
-                defer root_ctx.release();
-
-                var parent_ctx: *param.Context = root_ctx;
-                var needs_release = false;
-                if (SelectedContextPtr) |ptr| {
-                    parent_ctx = ptr.retain();
-                    needs_release = true;
-                } else if (SelectedContext) |sel_name| {
-                    root_ctx.rw_lock.lockShared();
-                    const sel_opt = root_ctx.children.get(sel_name);
-                    root_ctx.rw_lock.unlockShared();
-                    if (sel_opt) |sel_ctx| {
-                        parent_ctx = sel_ctx.retain();
-                        needs_release = true;
-                    }
-                }
-
-                defer if (needs_release) parent_ctx.release();
-
-                const created_ctx = parent_ctx.createClass(name, null) catch |err| {
-                    if (err == error.NameAlreadyExists) {
-                        try shell.stdout.print("Context '{s}' already exists\n", .{name});
-                        return;
-                    } else {
-                        return err;
-                    }
-                };
-                created_ctx.release();
-                try shell.stdout.print("Created context: {s}\n", .{name});
-            }
+        if (state.selected_config) |_| {
+            const parent_ctx = state.selected_context_ptr.?;
+            const created_ctx = try parent_ctx.createClass(name, null);
+            created_ctx.release();
+            try printSuccess(shell, "Created context: {s}", .{name});
         } else {
-            try shell.stdout.print("No config selected. Create a config first.\n", .{});
+            try printError(shell, "No config selected. Create a config first.", .{});
         }
     } else if (std.ascii.eqlIgnoreCase(action, "delete")) {
         if (name.len == 0) {
-            try shell.stdout.print("Usage: context delete <name>\n", .{});
+            try printUsage(shell, "context delete <name>");
             return;
         }
 
-        const configs = getConfigs();
+        if (state.selected_config) |_| {
+            const parent_ctx = state.selected_context_ptr.?;
 
-        if (SelectedConfig) |config_name| {
-            if (configs.get(config_name)) |root| {
-                const root_ctx = root.retain();
-                defer root_ctx.release();
-                root_ctx.removeClass(name) catch |err| {
-                    try shell.stdout.print("Error deleting context '{s}': {}\n", .{ name, err });
-                    return;
-                };
-                if (SelectedContext) |selected| {
-                    if (std.mem.eql(u8, selected, name)) {
-                        SelectedContext = null;
-                        if (SelectedContextPtr) |p| {
-                            p.release();
-                            SelectedContextPtr = null;
-                        }
+            parent_ctx.removeClass(name) catch |err| {
+                try printError(shell, "Error deleting context '{s}': {}", .{ name, err });
+                return;
+            };
+
+            if (state.selected_context) |selected| {
+                if (std.mem.eql(u8, selected, name)) {
+                    state.selected_context = ROOT_CONTEXT_NAME;
+                    if (state.selected_context_ptr) |p| {
+                        p.release();
                     }
+                    const root = state.configs.get(state.selected_config.?).?;
+                    state.selected_context_ptr = root.retain();
                 }
-                try shell.stdout.print("Deleted context: {s}\n", .{name});
             }
+            try printSuccess(shell, "Deleted context: {s}", .{name});
         } else {
-            try shell.stdout.print("No config selected\n", .{});
+            try printError(shell, "No config selected", .{});
         }
     } else if (std.ascii.eqlIgnoreCase(action, "select")) {
         if (name.len == 0) {
-            try shell.stdout.print("Usage: context select <name>\n", .{});
+            try printUsage(shell, "context select <name>");
             return;
         }
 
-        const configs = getConfigs();
-
-        if (SelectedConfig) |config_name| {
-            if (configs.get(config_name)) |root| {
+        if (state.selected_config) |config_name| {
+            if (state.configs.get(config_name)) |root| {
                 const root_ctx = root.retain();
                 defer root_ctx.release();
 
-                var parent_ctx: *param.Context = root_ctx;
-                var needs_release = false;
                 if (std.mem.eql(u8, name, "..")) {
-                    if (SelectedContextPtr) |ptr| {
+                    if (state.selected_context_ptr) |ptr| {
                         if (ptr.parent) |p| {
-                            parent_ctx = p;
-                            if (SelectedContextPtr) |old| old.release();
-                            SelectedContextPtr = p.retain();
-                            SelectedContext = p.name;
-                            try shell.stdout.print("Selected context: {s}\n", .{p.name});
-                            return;
+                            if (state.selected_context_ptr) |old| old.release();
+                            state.selected_context_ptr = p.retain();
+                            state.selected_context = p.name;
+                            try printSuccess(shell, "Selected context: {s}", .{p.name});
                         } else {
-                            if (SelectedContextPtr) |old| old.release();
-                            SelectedContextPtr = null;
-                            SelectedContext = null;
-                            try shell.stdout.print("Selected context: <root>\n", .{});
-                            return;
+                            if (state.selected_context_ptr) |old| old.release();
+                            state.selected_context_ptr = null;
+                            state.selected_context = ROOT_CONTEXT_NAME;
+                            try printSuccess(shell, "Selected context: <root>", .{});
                         }
-                    } else if (SelectedContext) |_| {
-                        SelectedContext = null;
-                        try shell.stdout.print("Selected context: <root>\n", .{});
-                        return;
+                    } else {
+                        state.selected_context = ROOT_CONTEXT_NAME;
+                        try printSuccess(shell, "Selected context: <root>", .{});
                     }
-                } else if (SelectedContextPtr) |ptr| {
-                    parent_ctx = ptr.retain();
-                    needs_release = true;
-                } else if (SelectedContext) |sel_name| {
-                    root_ctx.rw_lock.lockShared();
-                    const sel_opt = root_ctx.children.get(sel_name);
-                    root_ctx.rw_lock.unlockShared();
-                    if (sel_opt) |sel_ctx| {
-                        parent_ctx = sel_ctx.retain();
-                        needs_release = true;
-                    }
+                    return;
                 }
 
-                defer if (needs_release) parent_ctx.release();
-
-                parent_ctx.rw_lock.lockShared();
-                defer parent_ctx.rw_lock.unlockShared();
-
-                var ctx_it = parent_ctx.children.iterator();
-                var found = false;
-                while (ctx_it.next()) |entry| {
-                    if (std.mem.eql(u8, entry.key_ptr.*, name)) {
-                        SelectedContext = entry.key_ptr.*;
-                        found = true;
-                        break;
-                    }
-                }
-                if (found) {
-                    if (SelectedContextPtr) |old| old.release();
-                    if (needs_release) {
-                        parent_ctx.rw_lock.unlockShared();
-                        _ = parent_ctx.retain();
-                        parent_ctx.rw_lock.lockShared();
-                    }
-                    const sel_ptr = parent_ctx.children.get(SelectedContext.?).?;
-                    SelectedContextPtr = sel_ptr.retain();
-                    try shell.stdout.print("Selected context: {s}\n", .{name});
+                if (navigateToContext(root_ctx, name)) |target_ctx| {
+                    state.selected_context = name;
+                    state.selected_context_ptr = target_ctx.retain();
+                    try printSuccess(shell, "Selected context: {s}", .{name});
                 } else {
-                    try shell.stdout.print("Context '{s}' not found\n", .{name});
+                    try printError(shell, "Context '{s}' not found", .{name});
                 }
             }
         } else {
-            try shell.stdout.print("No config selected\n", .{});
+            try printError(shell, "No config selected", .{});
         }
     } else if (std.ascii.eqlIgnoreCase(action, "list")) {
-        const configs = getConfigs();
-        if (SelectedConfig) |config_name| {
-            if (configs.get(config_name)) |root| {
-                const root_ctx = root.retain();
-                defer root_ctx.release();
+        if (state.selected_config) |_| {
+            var target_ctx: *param.Context = undefined;
+            var header: []const u8 = undefined;
 
-                var parent_ctx: *param.Context = root_ctx;
-                var needs_release = false;
-                if (SelectedContext) |sel_name| {
-                    root_ctx.rw_lock.lockShared();
-                    const sel_opt = root_ctx.children.get(sel_name);
-                    root_ctx.rw_lock.unlockShared();
-                    if (sel_opt) |sel_ctx| {
-                        parent_ctx = sel_ctx.retain();
-                        needs_release = true;
-                    }
+            if (args.len > 1) {
+                const path = args[1];
+
+                if (navigateToContext(state.selected_context_ptr.?, path)) |ctx| {
+                    target_ctx = ctx;
+                    header = path;
+                } else {
+                    try printError(shell, "Context path '{s}' not found", .{path});
+                    return;
                 }
-                defer if (needs_release) parent_ctx.release();
-
-                parent_ctx.rw_lock.lockShared();
-                defer parent_ctx.rw_lock.unlockShared();
-
-                const header = if (SelectedContext) |sel_name| sel_name else "<root>";
-                try shell.stdout.print("Contexts under {s}:\n", .{header});
-
-                var it = parent_ctx.children.iterator();
-                var any: bool = false;
-                while (it.next()) |entry| {
-                    any = true;
-                    const marker = if (SelectedContext) |selected|
-                        if (std.mem.eql(u8, selected, entry.key_ptr.*)) " *" else "  "
-                    else
-                        "  ";
-                    try shell.stdout.print("  {s}{s}\n", .{ marker, entry.key_ptr.* });
-                }
-                if (!any) try shell.stdout.print("  <none>\n", .{});
+            } else {
+                target_ctx = state.selected_context_ptr.?;
+                header = if (state.selected_context) |sel_name| sel_name else ROOT_CONTEXT_NAME;
             }
+
+            try printSuccess(shell, "Contexts under {s}:", .{header});
+
+            target_ctx.rw_lock.lockShared();
+            defer target_ctx.rw_lock.unlockShared();
+
+            var it = target_ctx.children.iterator();
+            var any: bool = false;
+            while (it.next()) |entry| {
+                any = true;
+                const marker = if (state.selected_context) |selected|
+                    if (std.mem.eql(u8, selected, entry.key_ptr.*)) " *" else "  "
+                else
+                    "  ";
+                try shell.stdout.print("  {s}{s}\n", .{ marker, entry.key_ptr.* });
+            }
+            if (!any) try printSuccess(shell, "  <none>", .{});
         } else {
-            try shell.stdout.print("No config selected. Use 'config select <name>' first.\n", .{});
+            try printError(shell, "No config selected. Use 'config select <name>' first.", .{});
         }
     } else {
-        try shell.stdout.print("Unknown action: {s}. Use create, delete, select, or list\n", .{action});
+        try printError(shell, "Unknown action: {s}. Use create, delete, select, or list", .{action});
     }
 }
 
-fn paramLoadCommand(shell: *Shell, args: [][]const u8) !void {
+fn paramLoadCommand(shell: *Shell, args: []const []const u8) !void {
     if (args.len == 0) {
-        try shell.stdout.print("Usage: load <file_path> [config_name]\n", .{});
-        try shell.stdout.print("  <file_path>: Path to file to parse\n", .{});
-        try shell.stdout.print("  [config_name]: Optional config name or config.context path\n", .{});
-        try shell.stdout.print("    Examples:\n", .{});
-        try shell.stdout.print("      load game.cpp                    # Creates 'default' config\n", .{});
-        try shell.stdout.print("      load game.cpp my_config         # Creates 'my_config' config\n", .{});
-        try shell.stdout.print("      load game.cpp game.settings     # Loads into 'game' config, 'settings' context\n", .{});
-        return;
-    }
-
-    if (args.len < 1) {
-        try shell.stdout.print("Error: File path is required\n", .{});
+        try printUsage(shell, "load <file_path> [config_name]");
         return;
     }
 
     const file_path = args[0];
     const config_path = if (args.len > 1) args[1] else null;
+    const state = shell.getState();
 
-    if (config_path != null) {
-        if (std.mem.indexOfScalar(u8, config_path.?, '.')) |_| {
-            var path_parts = std.mem.splitScalar(u8, config_path.?, '.');
-            const config_name_part = path_parts.first();
-            const context_name_part = if (path_parts.next()) |ctx| ctx else null;
+    if (config_path) |path| {
+        if (std.mem.indexOfScalar(u8, path, '.')) |_| {
+            var path_parts = std.mem.splitScalar(u8, path, '.');
+            const config_name = path_parts.first();
+            const context_name = if (path_parts.next()) |ctx| ctx else null;
 
-            const configs = getConfigs();
-            if (configs.get(config_name_part)) |root| {
-                if (context_name_part) |ctx_name| {
+            if (state.configs.get(config_name)) |root| {
+                if (context_name) |ctx_name| {
                     const root_ctx = root.retain();
                     defer root_ctx.release();
 
-                    var target_ctx = root_ctx;
-                    root_ctx.rw_lock.lockShared();
-                    defer root_ctx.rw_lock.unlockShared();
-
-                    if (root_ctx.children.get(ctx_name)) |ctx| {
-                        target_ctx = ctx;
+                    if (navigateToContext(root_ctx, ctx_name)) |target_ctx| {
+                        var source = try param.src.Source.file(file_path, shell.allocator);
+                        defer source.deinit();
+                        try target_ctx.parse(source, false);
+                        try printSuccess(shell, "Loaded file '{s}' into config '{s}' context '{s}'", .{ file_path, config_name, ctx_name });
                     } else {
-                        try shell.stdout.print("Context '{s}' not found in config '{s}'\n", .{ ctx_name, config_name_part });
-                        return;
+                        try printError(shell, "Context '{s}' not found in config '{s}'", .{ ctx_name, config_name });
                     }
-
+                } else {
+                    const target_ctx = state.selected_context_ptr.?;
                     var source = try param.src.Source.file(file_path, shell.allocator);
                     defer source.deinit();
                     try target_ctx.parse(source, false);
-
-                    try shell.stdout.print("Loaded file '{s}' into config '{s}' context '{s}'\n", .{ file_path, config_name_part, ctx_name });
-                } else {
-                    root.parseFile(file_path, false) catch |err| {
-                        try shell.stdout.print("Error parsing file '{s}': {}\n", .{ file_path, err });
-                        return;
-                    };
-                    try shell.stdout.print("Loaded file '{s}' into config '{s}' root context\n", .{ file_path, config_name_part });
+                    try printSuccess(shell, "Loaded file '{s}' into config '{s}' context '{s}'", .{ file_path, config_name, state.selected_context.? });
                 }
             } else {
-                try shell.stdout.print("Config '{s}' not found\n", .{config_name_part});
-                return;
+                try printError(shell, "Config '{s}' not found", .{config_name});
             }
         } else {
-            const configs = getConfigs();
-            if (configs.get(config_path.?)) |_| {
-                try shell.stdout.print("Config '{s}' already exists. Use 'config_name.context_name' to load into existing config.\n", .{config_path.?});
-                return;
+            if (state.configs.get(path)) |_| {
+                const target_ctx = state.selected_context_ptr.?;
+                var source = try param.src.Source.file(file_path, shell.allocator);
+                defer source.deinit();
+                try target_ctx.parse(source, false);
+                try printSuccess(shell, "Loaded file '{s}' into config '{s}' context '{s}'", .{ file_path, path, state.selected_context.? });
+            } else {
+                try state.createConfig(path);
+                const target_ctx = state.selected_context_ptr.?;
+                var source = try param.src.Source.file(file_path, shell.allocator);
+                defer source.deinit();
+                try target_ctx.parse(source, false);
+                try printSuccess(shell, "Created config '{s}' and loaded file '{s}'", .{ path, file_path });
             }
-
-            const root = try param.Root.create(config_path.?, shell.allocator);
-            const name_copy = try shell.allocator.dupe(u8, config_path.?);
-            try configs.put(name_copy, root);
-
-            root.parseFile(file_path, false) catch |err| {
-                try shell.stdout.print("Error parsing file '{s}': {}\n", .{ file_path, err });
-                _ = configs.remove(config_path.?);
-                shell.allocator.free(name_copy);
-                root.release();
-                return;
-            };
-
-            try shell.stdout.print("Created config '{s}' and loaded file '{s}'\n", .{ config_path.?, file_path });
         }
     } else {
-        const default_name = "default";
-        const configs = getConfigs();
-
-        if (configs.get(default_name)) |_| {
-            try shell.stdout.print("Config '{s}' already exists. Specify a config name or use 'config_name.context_name'.\n", .{default_name});
+        const default_name = DEFAULT_CONFIG_NAME;
+        if (state.configs.get(default_name)) |_| {
+            try printError(shell, "Config '{s}' already exists. Specify a config name or use 'config_name.context_name'.", .{default_name});
             return;
         }
 
-        const root = try param.Root.create(default_name, shell.allocator);
-        const name_copy = try shell.allocator.dupe(u8, default_name);
-        try configs.put(name_copy, root);
-
-        root.parseFile(file_path, false) catch |err| {
-            try shell.stdout.print("Error parsing file '{s}': {}\n", .{ file_path, err });
-            _ = configs.remove(default_name);
-            shell.allocator.free(name_copy);
-            root.release();
-            return;
-        };
-
-        try shell.stdout.print("Created config '{s}' and loaded file '{s}'\n", .{ default_name, file_path });
+        try state.createConfig(default_name);
+        const target_ctx = state.selected_context_ptr.?;
+        var source = try param.src.Source.file(file_path, shell.allocator);
+        defer source.deinit();
+        try target_ctx.parse(source, false);
+        try printSuccess(shell, "Created config '{s}' and loaded file '{s}'", .{ default_name, file_path });
     }
 }
 
-fn paramDryloadCommand(shell: *Shell, args: [][]const u8) !void {
+fn paramDryloadCommand(shell: *Shell, args: []const []const u8) !void {
     if (args.len == 0) {
-        try shell.stdout.print("Usage: dryload <file_path> [--benchmark=N]\n", .{});
+        try printUsage(shell, "dryload <file_path> [--benchmark=N]");
         return;
     }
 
@@ -553,12 +635,12 @@ fn paramDryloadCommand(shell: *Shell, args: [][]const u8) !void {
         if (std.mem.startsWith(u8, opt, "--benchmark=")) {
             const num_str = opt["--benchmark=".len..];
             iterations = std.fmt.parseInt(usize, num_str, 10) catch {
-                try shell.stdout.print("Invalid --benchmark value: {s}\n", .{num_str});
+                try printError(shell, "Invalid --benchmark value: {s}", .{num_str});
                 return;
             };
             if (iterations == 0) iterations = 1;
         } else {
-            try shell.stdout.print("Unknown option: {s}\n", .{opt});
+            try printError(shell, "Unknown option: {s}", .{opt});
             return;
         }
     }
@@ -568,114 +650,109 @@ fn paramDryloadCommand(shell: *Shell, args: [][]const u8) !void {
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const root: *param.Root = try param.Root.create("__dry__", shell.allocator);
+        const root = try param.Root.create("__dry__", shell.allocator);
         defer root.release();
 
-        const root_ctx: *param.Context = root.retain();
+        const root_ctx = root.retain();
         defer root_ctx.release();
 
-        var source_inst = try param.src.Source.file(file_path, shell.allocator);
-        defer source_inst.deinit();
+        var source = try param.src.Source.file(file_path, shell.allocator);
+        defer source.deinit();
 
         var timer = try std.time.Timer.start();
+        try root_ctx.parse(source, false);
+        const elapsed_ns = timer.read();
 
-        try root_ctx.parse(source_inst, false);
-
-        const elapsed_ns: u128 = timer.read();
         totals_ns += elapsed_ns;
         if (elapsed_ns < min_ns) min_ns = elapsed_ns;
     }
 
     if (iterations > 1) {
-        const avg_ns: u128 = totals_ns / iterations;
-        try shell.stdout.print("[dryload] {d} iters  min {d} ms, avg {d} ms\n", .{
+        const avg_ns = totals_ns / iterations;
+        try printSuccess(shell, "[dryload] {d} iters  min {d} ms, avg {d} ms", .{
             iterations,
             @as(u64, @intCast(min_ns / 1_000_000)),
             @as(u64, @intCast(avg_ns / 1_000_000)),
         });
     } else {
-        try shell.stdout.print("[dryload] parsed {s}\n", .{file_path});
+        try printSuccess(shell, "[dryload] parsed {s}", .{file_path});
     }
 }
 
-fn paramListCommand(shell: *Shell, args: [][]const u8) !void {
+fn paramListCommand(shell: *Shell, args: []const []const u8) !void {
     if (args.len == 0) {
-        try shell.stdout.print("Usage: list <configs|contexts>\n", .{});
+        try printUsage(shell, "list <configs|contexts>");
         return;
     }
 
     const list_type = args[0];
+    const state = shell.getState();
 
     if (std.ascii.eqlIgnoreCase(list_type, "configs")) {
-        try shell.stdout.print("Available configs:\n", .{});
-        const configs = getConfigs();
-        var config_iter = configs.iterator();
+        try printSuccess(shell, "Available configs:", .{});
+        var config_iter = state.configs.iterator();
         while (config_iter.next()) |entry| {
             const config_name = entry.key_ptr.*;
-            const marker = if (SelectedConfig) |selected|
+            const marker = if (state.selected_config) |selected|
                 if (std.mem.eql(u8, selected, config_name)) " *" else "  "
             else
                 "  ";
-
             try shell.stdout.print("{s}{s}\n", .{ marker, config_name });
         }
 
-        if (configs.count() == 0) {
-            try shell.stdout.print("  <none>\n", .{});
+        if (state.configs.count() == 0) {
+            try printSuccess(shell, "  <none>", .{});
         }
     } else if (std.ascii.eqlIgnoreCase(list_type, "contexts")) {
-        if (SelectedConfig) |config_name| {
-            const configs = getConfigs();
-            if (configs.get(config_name)) |root| {
-                try shell.stdout.print("Contexts in config '{s}':\n", .{config_name});
-                const root_ctx = root.retain();
-                defer root_ctx.release();
+        if (state.selected_config) |_| {
+            try printSuccess(shell, "Contexts in config '{s}':", .{state.selected_config.?});
 
-                root_ctx.rw_lock.lockShared();
-                defer root_ctx.rw_lock.unlockShared();
+            const parent_ctx = state.selected_context_ptr.?;
 
-                var ctx_iter = root_ctx.children.iterator();
-                while (ctx_iter.next()) |entry| {
-                    const ctx_name = entry.key_ptr.*;
-                    const marker = if (SelectedContext) |selected|
-                        if (std.mem.eql(u8, selected, ctx_name)) " *" else "  "
-                    else
-                        "  ";
-                    try shell.stdout.print("  {s}{s}\n", .{ marker, ctx_name });
-                }
+            parent_ctx.rw_lock.lockShared();
+            defer parent_ctx.rw_lock.unlockShared();
 
-                if (root_ctx.children.count() == 0) {
-                    try shell.stdout.print("  <none>\n", .{});
-                }
+            var ctx_iter = parent_ctx.children.iterator();
+            while (ctx_iter.next()) |entry| {
+                const ctx_name = entry.key_ptr.*;
+                const marker = if (state.selected_context) |selected|
+                    if (std.mem.eql(u8, selected, ctx_name)) " *" else "  "
+                else
+                    "  ";
+                try shell.stdout.print("  {s}{s}\n", .{ marker, ctx_name });
+            }
+
+            if (parent_ctx.children.count() == 0) {
+                try printSuccess(shell, "  <none>", .{});
             }
         } else {
-            try shell.stdout.print("No config selected. Use 'config select <name>' first.\n", .{});
+            try printError(shell, "No config selected. Use 'config select <name>' first.", .{});
         }
     } else {
-        try shell.stdout.print("Unknown list type: {s}. Use 'configs' or 'contexts'\n", .{list_type});
+        try printError(shell, "Unknown list type: {s}. Use 'configs' or 'contexts'", .{list_type});
     }
 }
 
-fn paramStatusCommand(shell: *Shell, args: [][]const u8) !void {
+fn paramStatusCommand(shell: *Shell, args: []const []const u8) !void {
     _ = args;
+    const state = shell.getState();
 
-    try shell.stdout.print("=== Param Module Status ===\n", .{});
-    const configs = getConfigs();
-    try shell.stdout.print("Total configs loaded: {d}\n", .{configs.count()});
+    try printSuccess(shell, "=== Param Module Status ===", .{});
+    try printSuccess(shell, "Total configs loaded: {d}", .{state.configs.count()});
 
-    if (configs.count() == 0) {
-        try shell.stdout.print("No configs loaded\n", .{});
+    if (state.configs.count() == 0) {
+        try printSuccess(shell, "No configs loaded", .{});
         return;
     }
 
-    try shell.stdout.print("\nConfig Details:\n", .{});
-    var config_iter = configs.iterator();
+    try printSuccess(shell, "\nConfig Details:", .{});
+    var config_iter = state.configs.iterator();
     var total_memory: usize = 0;
 
     while (config_iter.next()) |entry| {
         const config_name = entry.key_ptr.*;
         const root = entry.value_ptr.*;
-        const marker = if (SelectedConfig) |selected|
+        const marker = if (state.selected_config) |selected|
             if (std.mem.eql(u8, selected, config_name)) " *" else "  "
         else
             "  ";
@@ -700,120 +777,87 @@ fn paramStatusCommand(shell: *Shell, args: [][]const u8) !void {
         try shell.stdout.print("    Est. Memory: ~{d} bytes\n", .{estimated_memory});
 
         if (std.mem.eql(u8, marker, " *")) {
-            if (SelectedContextPtr) |sel_ctx| {
+            if (state.selected_context_ptr) |sel_ctx| {
                 const full_path = try sel_ctx.getPath(shell.allocator);
                 defer shell.allocator.free(full_path);
 
-                try shell.stdout.print("    Selected Context Details:\n", .{});
-                try shell.stdout.print("      Path: {s}\n", .{full_path});
-                try shell.stdout.print("      Name: {s}\n", .{sel_ctx.name});
-                const parent_name = if (sel_ctx.parent) |p| p.name else "<root>";
-                try shell.stdout.print("      Parent: {s}\n", .{parent_name});
+                try printSuccess(shell, "    Selected Context Details:", .{});
+                try printSuccess(shell, "      Path: {s}", .{full_path});
+                try printSuccess(shell, "      Name: {s}", .{sel_ctx.name});
+                const parent_name = if (sel_ctx.parent) |p| p.name else "<none>";
+                try printSuccess(shell, "      Parent: {s}", .{parent_name});
                 const base_name = if (sel_ctx.base) |b| b.name else "<none>";
-                try shell.stdout.print("      Extends: {s}\n", .{base_name});
-                try shell.stdout.print("      Access: {d}\n", .{@intFromEnum(sel_ctx.access)});
+                try printSuccess(shell, "      Extends: {s}", .{base_name});
+                try printSuccess(shell, "      Access: {d}", .{@intFromEnum(sel_ctx.access)});
 
                 sel_ctx.rw_lock.lockShared();
                 const child_count = sel_ctx.children.count();
                 const param_count_ctx = sel_ctx.params.count();
-                var sources_set = std.StringHashMap(void).init(shell.allocator);
-                defer sources_set.deinit();
-                if (sel_ctx.source) |s| {
-                    _ = try sources_set.put(s.name, {});
-                }
-                {
-                    var pit = sel_ctx.params.iterator();
-                    while (pit.next()) |e| {
-                        if (e.value_ptr.*.source) |ps| {
-                            _ = try sources_set.put(ps.name, {});
-                        }
-                    }
-                }
-
-                try shell.stdout.print("      Children: {d}\n", .{child_count});
-                try shell.stdout.print("      Parameters: {d}\n", .{param_count_ctx});
-                try shell.stdout.print("      Sources: {d}\n", .{sources_set.count()});
-                {
-                    var sit = sources_set.iterator();
-                    while (sit.next()) |se| {
-                        try shell.stdout.print("        - {s}\n", .{se.key_ptr.*});
-                    }
-                }
-
-                if (param_count_ctx > 0) {
-                    try shell.stdout.print("      Parameters Detail:\n", .{});
-                    var pit2 = sel_ctx.params.iterator();
-                    while (pit2.next()) |pe| {
-                        const par = pe.value_ptr.*;
-                        const ps = try par.toSyntax(shell.allocator);
-                        defer shell.allocator.free(ps);
-                        const src_name = if (par.source) |psrc| psrc.name else "<none>";
-                        try shell.stdout.print("        - {s}  [source: {s}]\n", .{ ps, src_name });
-                    }
-                }
-
-                if (child_count > 0) {
-                    try shell.stdout.print("      Child Contexts:\n", .{});
-                    var cit = sel_ctx.children.iterator();
-                    while (cit.next()) |ce| {
-                        try shell.stdout.print("        - {s}\n", .{ce.key_ptr.*});
-                    }
-                }
                 sel_ctx.rw_lock.unlockShared();
-            } else if (SelectedContext) |ctx_name| {
-                try shell.stdout.print("    Selected Context: {s}\n", .{ctx_name});
-                if (context_count > 0) {
-                    try shell.stdout.print("    Available contexts:\n", .{});
-                    var ctx_iter = root_ctx.children.iterator();
-                    while (ctx_iter.next()) |ctx_entry| {
-                        const ctx_marker = if (SelectedContext) |selected|
-                            if (std.mem.eql(u8, selected, ctx_entry.key_ptr.*)) " *" else "  "
-                        else
-                            "  ";
-                        try shell.stdout.print("      {s}{s}\n", .{ ctx_marker, ctx_entry.key_ptr.* });
-                    }
-                }
+
+                try printSuccess(shell, "      Children: {d}", .{child_count});
+                try printSuccess(shell, "      Parameters: {d}", .{param_count_ctx});
+            } else if (state.selected_context) |ctx_name| {
+                try printSuccess(shell, "    Selected Context: {s}", .{ctx_name});
             }
         }
-        try shell.stdout.print("\n", .{});
+        try printSuccess(shell, "", .{});
     }
 
-    try shell.stdout.print("Total estimated memory usage: ~{d} bytes (~{d:.1} KB)\n", .{ total_memory, @as(f64, @floatFromInt(total_memory)) / 1024.0 });
+    try printSuccess(shell, "Total estimated memory usage: ~{d} bytes (~{d:.1} KB)", .{ total_memory, @as(f64, @floatFromInt(total_memory)) / 1024.0 });
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const stdout = std.io.getStdOut();
-    const stdin = std.io.getStdIn();
-    const in_reader = stdin.reader();
-
-    try stdout.writer().print("Welcome to bzhar CLI. Type 'help' for modules and usage.\n", .{});
-
-    var shell = try Shell.init(allocator, stdout.writer(), in_reader);
-    defer shell.deinit();
-
-    if (shell.cwd) |cwd| {
-        try stdout.writer().print("Current directory: {s}\n", .{cwd});
+fn paramSourceCommand(shell: *Shell, args: []const []const u8) !void {
+    if (args.len > 1) {
+        try printUsage(shell, "source [context_path]");
+        return;
     }
 
-    defer {
-        if (Configs) |configs| {
-            var config_iter = configs.iterator();
-            while (config_iter.next()) |entry| {
-                entry.value_ptr.*.release();
-                allocator.free(entry.key_ptr.*);
-            }
-            configs.deinit();
+    const state = shell.getState();
+    if (state.selected_config == null) {
+        try printError(shell, "No config selected. Use 'config select <name>' first.", .{});
+        return;
+    }
 
-            std.heap.page_allocator.destroy(configs);
+    const config_name = state.selected_config.?;
+    const root = state.configs.get(config_name).?;
+    const root_ctx = root.retain();
+    defer root_ctx.release();
+
+    var target_ctx: *param.Context = root_ctx;
+    var needs_release = false;
+
+    if (args.len == 1) {
+        const context_path = args[0];
+        if (navigateToContext(root_ctx, context_path)) |ctx| {
+            target_ctx = ctx.retain();
+            needs_release = true;
+        } else {
+            try printError(shell, "Context path '{s}' not found in config '{s}'", .{ context_path, config_name });
+            return;
         }
+    } else {
+        target_ctx = state.selected_context_ptr.?.retain();
+        needs_release = true;
     }
 
-    try shell.run();
+    defer if (needs_release) target_ctx.release();
+
+    const context_path = if (target_ctx == root_ctx)
+        "<root>"
+    else
+        try target_ctx.getPath(shell.allocator);
+
+    defer if (target_ctx != root_ctx) shell.allocator.free(context_path);
+
+    if (target_ctx.source) |source| {
+        try printSuccess(shell, "Context '{s}' source: {s}", .{ context_path, source.name });
+    } else {
+        try printSuccess(shell, "Context '{s}' has no source", .{context_path});
+    }
 }
+
+// Shell Implementation
 
 const Shell = struct {
     allocator: Allocator,
@@ -823,6 +867,7 @@ const Shell = struct {
     current_prompt: []const u8 = "module> ",
     cwd: ?[]u8 = null,
     modules: []const ModuleSpec,
+    state: State,
 
     fn init(allocator: Allocator, stdout: std.fs.File.Writer, stdin: std.fs.File.Reader) !Shell {
         var shell = Shell{
@@ -830,10 +875,10 @@ const Shell = struct {
             .stdout = stdout,
             .stdin = stdin,
             .modules = &Modules.*,
+            .state = State.init(allocator),
         };
 
         shell.cwd = try shell.getCurrentWorkingDir();
-
         return shell;
     }
 
@@ -841,6 +886,11 @@ const Shell = struct {
         if (self.cwd) |cwd| {
             self.allocator.free(cwd);
         }
+        self.state.deinit();
+    }
+
+    fn getState(self: *Shell) *State {
+        return &self.state;
     }
 
     fn getCurrentWorkingDir(self: *Shell) ![]u8 {
@@ -855,10 +905,9 @@ const Shell = struct {
 
     fn run(self: *Shell) !void {
         var current: Mode = .root;
-        const current_module_index: usize = 0;
 
         while (true) {
-            try self.printPrompt(current, current_module_index);
+            try self.printPrompt(current);
             const line_opt = try self.readLine(8192);
             if (line_opt == null) break;
 
@@ -903,11 +952,19 @@ const Shell = struct {
                     try self.stdout.print("Unknown command. Type 'help'.\n", .{});
                     return false;
                 };
+
                 var args_buf = std.ArrayList([]const u8).init(self.allocator);
                 defer args_buf.deinit();
-                while (tokens.next()) |a| try args_buf.append(a);
+                while (tokens.next()) |a| {
+                    const arg_copy = try self.allocator.dupe(u8, a);
+                    try args_buf.append(arg_copy);
+                }
                 const args = try args_buf.toOwnedSlice();
-                defer self.allocator.free(args);
+                defer {
+                    for (args) |arg| self.allocator.free(arg);
+                    self.allocator.free(args);
+                }
+
                 if (!(try self.invokeCurrentModule(cmd, args))) {
                     try self.stdout.print("Unknown command. Type 'help'.\n", .{});
                 }
@@ -932,15 +989,21 @@ const Shell = struct {
         if (std.ascii.eqlIgnoreCase(cmd, "cd")) {
             var args_buf = std.ArrayList([]const u8).init(self.allocator);
             defer args_buf.deinit();
-            while (tokens.next()) |a| try args_buf.append(a);
+            while (tokens.next()) |a| {
+                const arg_copy = try self.allocator.dupe(u8, a);
+                try args_buf.append(arg_copy);
+            }
             const args = try args_buf.toOwnedSlice();
-            defer self.allocator.free(args);
-            try rootCd(self, args);
+            defer {
+                for (args) |arg| self.allocator.free(arg);
+                self.allocator.free(args);
+            }
+            try self.rootCd(args);
             return false;
         }
 
         if (std.ascii.eqlIgnoreCase(cmd, "pwd")) {
-            try rootPwd(self, &[_][]const u8{});
+            try self.rootPwd();
             return false;
         }
 
@@ -965,8 +1028,40 @@ const Shell = struct {
         return null;
     }
 
-    fn printPrompt(self: *Shell, mode: Mode, module_index: usize) !void {
-        _ = module_index;
+    fn rootCd(self: *Shell, args: []const []const u8) !void {
+        if (args.len == 0) {
+            try printUsage(self, "cd <directory>");
+            return;
+        }
+
+        const target = args[0];
+        var target_dir = std.fs.cwd().openDir(target, .{}) catch |err| {
+            try printError(self, "Error changing directory to '{s}': {}", .{ target, err });
+            return;
+        };
+        defer target_dir.close();
+
+        target_dir.setAsCwd() catch |err| {
+            try printError(self, "Error setting '{s}' as current directory: {}", .{ target, err });
+            return;
+        };
+
+        if (self.cwd) |old_cwd| {
+            self.allocator.free(old_cwd);
+        }
+        self.cwd = try self.getCurrentWorkingDir();
+        try printSuccess(self, "Changed to: {s}", .{self.cwd.?});
+    }
+
+    fn rootPwd(self: *Shell) !void {
+        if (self.cwd) |cwd| {
+            try printSuccess(self, "{s}", .{cwd});
+        } else {
+            try printSuccess(self, "Unknown working directory", .{});
+        }
+    }
+
+    fn printPrompt(self: *Shell, mode: Mode) !void {
         switch (mode) {
             .root => {
                 if (self.cwd) |cwd| {
@@ -984,11 +1079,11 @@ const Shell = struct {
 
                     try prompt_buf.appendSlice("param");
 
-                    if (SelectedConfig) |config| {
+                    if (self.state.selected_config) |config| {
                         try prompt_buf.appendSlice("[");
                         try prompt_buf.appendSlice(config);
 
-                        if (SelectedContextPtr) |ctx_ptr| {
+                        if (self.state.selected_context_ptr) |ctx_ptr| {
                             const path = try ctx_ptr.getPath(self.allocator);
                             defer self.allocator.free(path);
                             const first_dot = std.mem.indexOfScalar(u8, path, '.');
@@ -996,7 +1091,7 @@ const Shell = struct {
                                 try prompt_buf.appendSlice(".");
                                 try prompt_buf.appendSlice(path[idx + 1 ..]);
                             }
-                        } else if (SelectedContext) |ctx| {
+                        } else if (self.state.selected_context) |ctx| {
                             try prompt_buf.appendSlice(".");
                             try prompt_buf.appendSlice(ctx);
                         }
@@ -1005,18 +1100,12 @@ const Shell = struct {
                     }
 
                     try prompt_buf.appendSlice("> ");
-
                     try self.stdout.print("{s}", .{prompt_buf.items});
                 } else {
                     try self.stdout.print("{s}", .{self.current_prompt});
                 }
             },
         }
-    }
-
-    fn getRootCommands(self: *Shell) []const []const u8 {
-        _ = self;
-        return &[_][]const u8{ "help", "exit", "cd", "pwd", "module" };
     }
 
     fn printCompletions(self: *Shell, mode: Mode, prefix: []const u8) !void {
@@ -1033,7 +1122,7 @@ const Shell = struct {
             }
         }
 
-        inline for (Modules) |m| {
+        for (self.modules) |m| {
             if (std.mem.startsWith(u8, m.name, last_token)) {
                 try self.stdout.print("  {s} (module)\n", .{m.name});
                 found_any = true;
@@ -1047,7 +1136,7 @@ const Shell = struct {
                     try self.stdout.print("  back (return to root)\n", .{});
                     found_any = true;
                 }
-                inline for (Modules) |m| {
+                for (self.modules) |m| {
                     if (std.ascii.eqlIgnoreCase(m.name, self.current_module_name)) {
                         for (m.commands) |c| {
                             if (std.mem.startsWith(u8, c.name, last_token)) {
@@ -1081,16 +1170,16 @@ const Shell = struct {
         switch (mode) {
             .root => {
                 try self.stdout.print("Root commands:\n  help\n  exit\n  pwd\n  cd <directory>\n  module <name> //[or type module name directly]\n\nModules:\n", .{});
-                if (Modules.len == 0) {
+                if (self.modules.len == 0) {
                     try self.stdout.print("  <none>\n", .{});
                 } else {
-                    inline for (Modules) |m| try self.stdout.print("  {s}\n", .{m.name});
+                    for (self.modules) |m| try self.stdout.print("  {s}\n", .{m.name});
                 }
             },
             .module => {
                 try self.stdout.print("Global commands:\n  help\n  exit\n  pwd\n  cd <directory>\n  back (return to root)\n\n", .{});
 
-                inline for (Modules) |m| {
+                for (self.modules) |m| {
                     if (std.ascii.eqlIgnoreCase(m.name, self.current_module_name)) {
                         try self.stdout.print("Module {s} commands:\n", .{m.name});
                         if (m.commands.len == 0) {
@@ -1107,8 +1196,7 @@ const Shell = struct {
     }
 
     fn enterModule(self: *Shell, name: []const u8) !bool {
-        inline for (Modules, 0..) |m, i| {
-            _ = i;
+        for (self.modules) |m| {
             if (std.ascii.eqlIgnoreCase(m.name, name)) {
                 self.current_module_name = m.name;
                 self.current_prompt = m.prompt;
@@ -1118,8 +1206,8 @@ const Shell = struct {
         return false;
     }
 
-    fn invokeCurrentModule(self: *Shell, cmd: []const u8, args: [][]const u8) !bool {
-        inline for (Modules) |m| {
+    fn invokeCurrentModule(self: *Shell, cmd: []const u8, args: []const []const u8) !bool {
+        for (self.modules) |m| {
             if (std.ascii.eqlIgnoreCase(m.name, self.current_module_name)) {
                 for (m.commands) |c| {
                     if (std.ascii.eqlIgnoreCase(c.name, cmd)) {
@@ -1131,23 +1219,16 @@ const Shell = struct {
         }
         return false;
     }
+
+    fn getRootCommands(self: *Shell) []const []const u8 {
+        _ = self;
+        return &[_][]const u8{ "help", "exit", "cd", "pwd", "module" };
+    }
 };
 
+// Utility Functions
+
 const Mode = enum { root, module };
-
-const RootAction = union(enum) { Help, Exit, Module: []const u8, Unknown };
-
-fn parseRoot(line: []const u8) RootAction {
-    var it = std.mem.tokenizeAny(u8, line, " \t");
-    const first = it.next() orelse return .Unknown;
-    if (std.ascii.eqlIgnoreCase(first, "help")) return .Help;
-    if (std.ascii.eqlIgnoreCase(first, "exit")) return .Exit;
-    if (std.ascii.eqlIgnoreCase(first, "module")) {
-        if (it.next()) |name| return .{ .Module = name };
-        return .Unknown;
-    }
-    return .{ .Module = first };
-}
 
 fn getLastToken(line: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, line, " \t");
@@ -1157,4 +1238,26 @@ fn getLastToken(line: []const u8) []const u8 {
     var last: []const u8 = "";
     while (it.next()) |tok| last = tok;
     return last;
+}
+
+// Entry Point
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const stdout = std.io.getStdOut();
+    const stdin = std.io.getStdIn();
+    const in_reader = stdin.reader();
+
+    try stdout.writer().print("Welcome to bzhar CLI. Type 'help' for modules and usage.\n", .{});
+
+    var shell = try Shell.init(allocator, stdout.writer(), in_reader);
+    defer shell.deinit();
+
+    if (shell.cwd) |cwd| {
+        try stdout.writer().print("Current directory: {s}\n", .{cwd});
+    }
+
+    try shell.run();
 }
