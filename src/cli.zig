@@ -37,9 +37,10 @@ pub const paramCommands = &[_]CommandSpec{
     .{ .name = "context", .help = "create/delete/select/list [name] [path]", .handler = paramContextCommand },
     .{ .name = "load", .help = "<file_path> [config_name]", .handler = paramLoadCommand },
     .{ .name = "dryload", .help = "<file_path> [--benchmark=N]", .handler = paramDryloadCommand },
-    .{ .name = "list", .help = "<configs|contexts>", .handler = paramListCommand },
+    .{ .name = "list", .help = "<configs|contexts|parameters>", .handler = paramListCommand },
     .{ .name = "status", .help = "", .handler = paramStatusCommand },
     .{ .name = "source", .help = "[context_path]", .handler = paramSourceCommand },
+    .{ .name = "dump", .help = "[--file=path] [context_path]", .handler = paramDumpCommand },
 };
 
 // State Management
@@ -75,6 +76,10 @@ const State = struct {
         if (self.selected_context_ptr) |ptr| {
             ptr.release();
         }
+
+        if (self.selected_config) |config_name| {
+            self.allocator.free(config_name);
+        }
     }
 
     pub fn getOrCreateDefaultConfig(self: *State) !*param.Root {
@@ -99,7 +104,12 @@ const State = struct {
 
     pub fn selectConfig(self: *State, name: []const u8) !void {
         if (self.configs.get(name)) |root| {
-            self.selected_config = name;
+            // Free the old selected config name if it exists
+            if (self.selected_config) |old_name| {
+                self.allocator.free(old_name);
+            }
+            // Make a copy of the new config name to ensure it persists
+            self.selected_config = try self.allocator.dupe(u8, name);
 
             self.selected_context = ROOT_CONTEXT_NAME;
             if (self.selected_context_ptr) |ptr| {
@@ -121,7 +131,7 @@ const State = struct {
         try self.configs.put(name_copy, root);
 
         if (self.selected_config == null) {
-            self.selected_config = name;
+            self.selected_config = try self.allocator.dupe(u8, name);
             self.selected_context = ROOT_CONTEXT_NAME;
             self.selected_context_ptr = root.retain();
         }
@@ -207,10 +217,10 @@ fn dryCompressCommand(shell: *Shell, args: []const []const u8) !void {
 
     const input_spec = args[0];
     const count_str = args[1];
-    
+
     var roundtrip = false;
     var output_errored_path: ?[]const u8 = null;
-    
+
     // Parse optional flags
     var arg_idx: usize = 2;
     while (arg_idx < args.len) : (arg_idx += 1) {
@@ -317,12 +327,12 @@ fn dryCompressCommand(shell: *Shell, args: []const []const u8) !void {
                         return;
                     };
                     defer file.close();
-                    
+
                     file.writeAll(decompressed) catch |err| {
                         try printError(shell, "Failed to write to output file '{s}': {s}", .{ path, @errorName(err) });
                         return;
                     };
-                    
+
                     try printError(shell, "Roundtrip verification failed: data mismatch. Decompressed data written to '{s}'", .{path});
                 } else {
                     try printError(shell, "Roundtrip verification failed: data mismatch", .{});
@@ -572,7 +582,20 @@ fn paramLoadCommand(shell: *Shell, args: []const []const u8) !void {
                     defer root_ctx.release();
 
                     if (navigateToContext(root_ctx, ctx_name)) |target_ctx| {
-                        var source = try param.src.Source.file(file_path, shell.allocator);
+                        var source = param.src.Source.file(file_path, shell.allocator) catch |err| switch (err) {
+                            error.FileNotFound => {
+                                try printError(shell, "File '{s}' not found", .{file_path});
+                                return;
+                            },
+                            error.AccessDenied => {
+                                try printError(shell, "Access denied to file '{s}'", .{file_path});
+                                return;
+                            },
+                            else => {
+                                try printError(shell, "Failed to open file '{s}': {s}", .{ file_path, @errorName(err) });
+                                return;
+                            },
+                        };
                         defer source.deinit();
                         try target_ctx.parse(source, false);
                         try printSuccess(shell, "Loaded file '{s}' into config '{s}' context '{s}'", .{ file_path, config_name, ctx_name });
@@ -581,7 +604,20 @@ fn paramLoadCommand(shell: *Shell, args: []const []const u8) !void {
                     }
                 } else {
                     const target_ctx = state.selected_context_ptr.?;
-                    var source = try param.src.Source.file(file_path, shell.allocator);
+                    var source = param.src.Source.file(file_path, shell.allocator) catch |err| switch (err) {
+                        error.FileNotFound => {
+                            try printError(shell, "File '{s}' not found", .{file_path});
+                            return;
+                        },
+                        error.AccessDenied => {
+                            try printError(shell, "Access denied to file '{s}'", .{file_path});
+                            return;
+                        },
+                        else => {
+                            try printError(shell, "Failed to open file '{s}': {s}", .{ file_path, @errorName(err) });
+                            return;
+                        },
+                    };
                     defer source.deinit();
                     try target_ctx.parse(source, false);
                     try printSuccess(shell, "Loaded file '{s}' into config '{s}' context '{s}'", .{ file_path, config_name, state.selected_context.? });
@@ -592,14 +628,41 @@ fn paramLoadCommand(shell: *Shell, args: []const []const u8) !void {
         } else {
             if (state.configs.get(path)) |_| {
                 const target_ctx = state.selected_context_ptr.?;
-                var source = try param.src.Source.file(file_path, shell.allocator);
+                var source = param.src.Source.file(file_path, shell.allocator) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        try printError(shell, "File '{s}' not found", .{file_path});
+                        return;
+                    },
+                    error.AccessDenied => {
+                        try printError(shell, "Access denied to file '{s}'", .{file_path});
+                        return;
+                    },
+                    else => {
+                        try printError(shell, "Failed to open file '{s}': {s}", .{ file_path, @errorName(err) });
+                        return;
+                    },
+                };
                 defer source.deinit();
                 try target_ctx.parse(source, false);
                 try printSuccess(shell, "Loaded file '{s}' into config '{s}' context '{s}'", .{ file_path, path, state.selected_context.? });
             } else {
                 try state.createConfig(path);
+                try state.selectConfig(path);
                 const target_ctx = state.selected_context_ptr.?;
-                var source = try param.src.Source.file(file_path, shell.allocator);
+                var source = param.src.Source.file(file_path, shell.allocator) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        try printError(shell, "File '{s}' not found", .{file_path});
+                        return;
+                    },
+                    error.AccessDenied => {
+                        try printError(shell, "Access denied to file '{s}'", .{file_path});
+                        return;
+                    },
+                    else => {
+                        try printError(shell, "Failed to open file '{s}': {s}", .{ file_path, @errorName(err) });
+                        return;
+                    },
+                };
                 defer source.deinit();
                 try target_ctx.parse(source, false);
                 try printSuccess(shell, "Created config '{s}' and loaded file '{s}'", .{ path, file_path });
@@ -613,8 +676,22 @@ fn paramLoadCommand(shell: *Shell, args: []const []const u8) !void {
         }
 
         try state.createConfig(default_name);
+        try state.selectConfig(default_name);
         const target_ctx = state.selected_context_ptr.?;
-        var source = try param.src.Source.file(file_path, shell.allocator);
+        var source = param.src.Source.file(file_path, shell.allocator) catch |err| switch (err) {
+            error.FileNotFound => {
+                try printError(shell, "File '{s}' not found", .{file_path});
+                return;
+            },
+            error.AccessDenied => {
+                try printError(shell, "Access denied to file '{s}'", .{file_path});
+                return;
+            },
+            else => {
+                try printError(shell, "Failed to open file '{s}': {s}", .{ file_path, @errorName(err) });
+                return;
+            },
+        };
         defer source.deinit();
         try target_ctx.parse(source, false);
         try printSuccess(shell, "Created config '{s}' and loaded file '{s}'", .{ default_name, file_path });
@@ -656,7 +733,20 @@ fn paramDryloadCommand(shell: *Shell, args: []const []const u8) !void {
         const root_ctx = root.retain();
         defer root_ctx.release();
 
-        var source = try param.src.Source.file(file_path, shell.allocator);
+        var source = param.src.Source.file(file_path, shell.allocator) catch |err| switch (err) {
+            error.FileNotFound => {
+                try printError(shell, "File '{s}' not found", .{file_path});
+                return;
+            },
+            error.AccessDenied => {
+                try printError(shell, "Access denied to file '{s}'", .{file_path});
+                return;
+            },
+            else => {
+                try printError(shell, "Failed to open file '{s}': {s}", .{ file_path, @errorName(err) });
+                return;
+            },
+        };
         defer source.deinit();
 
         var timer = try std.time.Timer.start();
@@ -681,7 +771,7 @@ fn paramDryloadCommand(shell: *Shell, args: []const []const u8) !void {
 
 fn paramListCommand(shell: *Shell, args: []const []const u8) !void {
     if (args.len == 0) {
-        try printUsage(shell, "list <configs|contexts>");
+        try printUsage(shell, "list <configs|contexts|parameters>");
         return;
     }
 
@@ -728,8 +818,56 @@ fn paramListCommand(shell: *Shell, args: []const []const u8) !void {
         } else {
             try printError(shell, "No config selected. Use 'config select <name>' first.", .{});
         }
+    } else if (std.ascii.eqlIgnoreCase(list_type, "parameters")) {
+        if (state.selected_config == null) {
+            try printError(shell, "No config selected. Use 'config select <name>' first.", .{});
+            return;
+        }
+
+        var target_ctx: *param.Context = undefined;
+        var context_path: []const u8 = undefined;
+        var needs_release = false;
+
+        if (args.len > 1) {
+            const path = args[1];
+            if (navigateToContext(state.selected_context_ptr.?, path)) |ctx| {
+                target_ctx = ctx.retain();
+                needs_release = true;
+                context_path = path;
+            } else {
+                try printError(shell, "Context path '{s}' not found", .{path});
+                return;
+            }
+        } else {
+            target_ctx = state.selected_context_ptr.?;
+            context_path = if (state.selected_context) |sel_name| sel_name else ROOT_CONTEXT_NAME;
+        }
+
+        defer if (needs_release) target_ctx.release();
+
+        try printSuccess(shell, "Parameters in context '{s}':", .{context_path});
+
+        target_ctx.rw_lock.lockShared();
+        defer target_ctx.rw_lock.unlockShared();
+
+        var param_iter = target_ctx.params.iterator();
+        var any_params = false;
+        while (param_iter.next()) |entry| {
+            any_params = true;
+            const param_name = entry.key_ptr.*;
+            const param_ptr = entry.value_ptr.*;
+
+            const value_str = try param_ptr.value.toSyntax(shell.allocator);
+            defer shell.allocator.free(value_str);
+
+            try shell.stdout.print("  {s} = {s}\n", .{ param_name, value_str });
+        }
+
+        if (!any_params) {
+            try printSuccess(shell, "  <none>", .{});
+        }
     } else {
-        try printError(shell, "Unknown list type: {s}. Use 'configs' or 'contexts'", .{list_type});
+        try printError(shell, "Unknown list type: {s}. Use 'configs', 'contexts', or 'parameters'", .{list_type});
     }
 }
 
@@ -857,6 +995,75 @@ fn paramSourceCommand(shell: *Shell, args: []const []const u8) !void {
     }
 }
 
+fn paramDumpCommand(shell: *Shell, args: []const []const u8) !void {
+    var output_path: ?[]const u8 = null;
+    var context_path: ?[]const u8 = null;
+
+    // Parse arguments
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.startsWith(u8, arg, "--file=")) {
+            output_path = arg["--file=".len..];
+        } else if (context_path == null) {
+            context_path = arg;
+        } else {
+            try printError(shell, "Unexpected argument: {s}", .{arg});
+            try printUsage(shell, "dump [--file=path] [context_path]");
+            return;
+        }
+    }
+
+    const state = shell.getState();
+    if (state.selected_config == null) {
+        try printError(shell, "No config selected. Use 'config select <name>' first.", .{});
+        return;
+    }
+
+    const config_name = state.selected_config.?;
+    const root = state.configs.get(config_name).?;
+    const root_ctx = root.retain();
+    defer root_ctx.release();
+
+    var target_ctx: *param.Context = root_ctx;
+    var needs_release = false;
+
+    if (context_path) |path| {
+        if (navigateToContext(root_ctx, path)) |ctx| {
+            target_ctx = ctx.retain();
+            needs_release = true;
+        } else {
+            try printError(shell, "Context path '{s}' not found in config '{s}'", .{ path, config_name });
+            return;
+        }
+    } else {
+        target_ctx = state.selected_context_ptr.?.retain();
+        needs_release = true;
+    }
+
+    defer if (needs_release) target_ctx.release();
+
+    // Get the context syntax
+    const context_syntax = try target_ctx.toSyntax(shell.allocator, 0);
+    defer shell.allocator.free(context_syntax);
+
+    if (output_path) |path| {
+        // Write to file
+        const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+            try printError(shell, "Failed to create output file '{s}': {s}", .{ path, @errorName(err) });
+            return;
+        };
+        defer file.close();
+
+        try file.writeAll(context_syntax);
+        try printSuccess(shell, "Dumped context to file '{s}'", .{path});
+    } else {
+        // Output to console
+        try printSuccess(shell, "Dumping context:", .{});
+        try shell.stdout.print("{s}\n", .{context_syntax});
+    }
+}
+
 // Shell Implementation
 
 const Shell = struct {
@@ -885,6 +1092,9 @@ const Shell = struct {
     fn deinit(self: *Shell) void {
         if (self.cwd) |cwd| {
             self.allocator.free(cwd);
+        }
+        if (self.current_module_name.len > 0) {
+            self.allocator.free(self.current_module_name);
         }
         self.state.deinit();
     }
@@ -942,7 +1152,10 @@ const Shell = struct {
 
                 if (std.ascii.eqlIgnoreCase(lower, "back")) {
                     current.* = .root;
-                    self.current_module_name = &[_]u8{};
+                    if (self.current_module_name.len > 0) {
+                        self.allocator.free(self.current_module_name);
+                        self.current_module_name = &[_]u8{};
+                    }
                     self.current_prompt = "module> ";
                     return false;
                 }
@@ -1155,7 +1368,58 @@ const Shell = struct {
     }
 
     fn readLine(self: *Shell, max: usize) !?[]u8 {
-        return try self.stdin.readUntilDelimiterOrEofAlloc(self.allocator, '\n', max);
+        var buffer = std.ArrayList(u8).init(self.allocator);
+        defer buffer.deinit();
+
+        while (buffer.items.len < max) {
+            const byte = try self.stdin.readByte();
+
+            if (byte == '\n' or byte == '\r') {
+                break;
+            } else if (byte == 27) { // ESC - potential arrow key
+                // Try to read the next bytes to see if it's an arrow key
+                const next_byte = self.stdin.readByte() catch break;
+                if (next_byte == '[') {
+                    const third_byte = self.stdin.readByte() catch break;
+                    switch (third_byte) {
+                        'A' => { // Up arrow
+                            // TODO: Implement history navigation
+                        },
+                        'B' => { // Down arrow
+                            // TODO: Implement history navigation
+                        },
+                        'C' => { // Right arrow
+                            // TODO: Implement cursor movement
+                        },
+                        'D' => { // Left arrow
+                            // TODO: Implement cursor movement
+                        },
+                        else => {
+                            // Not an arrow key, add the ESC sequence to buffer
+                            try buffer.append(byte);
+                            try buffer.append(next_byte);
+                            try buffer.append(third_byte);
+                        },
+                    }
+                } else {
+                    // Not an arrow key, add ESC and next byte to buffer
+                    try buffer.append(byte);
+                    try buffer.append(next_byte);
+                }
+            } else if (byte == 127) { // Backspace
+                if (buffer.items.len > 0) {
+                    _ = buffer.pop();
+                    // Print backspace character to move cursor back
+                    try self.stdout.print("\x08 \x08", .{});
+                }
+            } else if (byte >= 32 and byte <= 126) { // Printable ASCII
+                try buffer.append(byte);
+                // Don't echo characters - let the terminal handle display
+            }
+        }
+
+        try self.stdout.print("\n", .{});
+        return try buffer.toOwnedSlice();
     }
 
     fn stripCrLf(self: *Shell, s_ptr: *[]u8) void {
@@ -1198,7 +1462,11 @@ const Shell = struct {
     fn enterModule(self: *Shell, name: []const u8) !bool {
         for (self.modules) |m| {
             if (std.ascii.eqlIgnoreCase(m.name, name)) {
-                self.current_module_name = m.name;
+                // Store a copy of the module name to ensure it persists
+                if (self.current_module_name.len > 0 and self.current_module_name.ptr != m.name.ptr) {
+                    self.allocator.free(self.current_module_name);
+                }
+                self.current_module_name = try self.allocator.dupe(u8, m.name);
                 self.current_prompt = m.prompt;
                 return true;
             }
